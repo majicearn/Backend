@@ -74,9 +74,10 @@ async function query(sql, params) {
   return await pool.query(sql, params);
 }
 
-// Export both the pool and the functions for flexibility
-module.exports = pool;
-module.exports.initializeDatabase = initializeDatabase;
-module.exports.getPool = getPool;
-module.exports.isReady = isReady;
-module.exports.query = query;
+// Export the functions, not the pool directly
+module.exports = {
+  initializeDatabase,
+  getPool,
+  isReady,
+  query
+};
