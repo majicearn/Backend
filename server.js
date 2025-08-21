@@ -1,4 +1,4 @@
-// server.js - MajicEarn backend (Railway optimized) with DB file storage
+// server.js - MajicEarn backend (Railway optimized)
 require('dotenv').config();
 const express = require('express');
 const helmet = require('helmet');
@@ -11,14 +11,15 @@ const path = require('path');
 const winston = require('winston');
 const cron = require('node-cron');
 const multer = require('multer');
-const db = require('./config/db'); // Import the new db module
+
+// Database connection
+const db = require('./config/db');
 
 const app = express();
 
 // ============================
-// MULTER CONFIGURATION FOR MEMORY STORAGE
+// MULTER CONFIGURATION
 // ============================
-// Store files in memory temporarily before saving to database
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -27,7 +28,7 @@ const upload = multer({
 });
 
 // ============================
-// PROXY CONFIGURATION (CRITICAL FOR RATE LIMITING)
+// PROXY CONFIGURATION
 // ============================
 app.set('trust proxy', 1); // Trust Railway's proxy
 
@@ -69,34 +70,42 @@ app.use((req, res, next) => {
 });
 
 // ============================
-// DATABASE SETUP USING NEW MODULE
+// DATABASE INITIALIZATION
 // ============================
+let dbInitialized = false;
+
 // Initialize database connection
-db.initializeDatabase()
-  .then(() => {
+const initializeApp = async () => {
+  try {
+    await db.initializeDatabase();
+    dbInitialized = true;
     logger.info("✅ Database initialized successfully");
+    
     // Run migrations after successful connection
     setTimeout(() => {
       runMigrationsIfNeeded().catch(e => {
         logger.error('❌ Migrations failed:', e.message);
       });
     }, 2000);
-  })
-  .catch(err => {
+    
+    return true;
+  } catch (err) {
     logger.error("❌ Database initialization failed:", err.message);
-  });
+    return false;
+  }
+};
 
 // ============================
 // HELPER FUNCTIONS
 // ============================
 async function runMigrationsIfNeeded() {
-  if (!db.isReady()) {
+  if (!dbInitialized) {
     logger.error("❌ Migration skipped: Database not ready");
     return;
   }
   
   if (process.env.AUTO_MIGRATE !== '1') {
-    return; // Silent return if migration disabled
+    return;
   }
   
   const schemaPath = path.join(__dirname, 'sql', 'schema.sql');
@@ -147,57 +156,41 @@ function parseWithdrawalRules(json) {
   }
 }
 
+// Database readiness middleware
+const checkDbReady = (req, res, next) => {
+  if (!dbInitialized) {
+    return res.status(503).json({ error: 'Database not ready' });
+  }
+  next();
+};
+
 // ============================
 // ROUTES
 // ============================
+
 // Root route for Railway health checks
 app.get('/', (req, res) => {
   res.json({
     status: "ok",
     message: "MajicEarn Backend is running",
     time: new Date().toISOString(),
-    environment: process.env.NODE_ENV || 'development'
+    environment: process.env.NODE_ENV || 'development',
+    dbStatus: dbInitialized ? 'connected' : 'disconnected'
   });
 });
 
-// Enhanced Health check
-app.get('/api/health', (req, res) => {
-  const status = db.isReady() ? 'ok' : 'degraded';
-  res.json({ 
-    status,
+// Health check endpoint
+app.get('/health', (req, res) {
+  res.status(200).json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    db: db.isReady() ? 'connected' : 'disconnected',
-    time: new Date().toISOString()
+    dbStatus: dbInitialized ? 'connected' : 'disconnected'
   });
-});
-
-// Temporary debug route
-app.get('/debug', async (req, res) => {
-  try {
-    const [dbRows] = await db.query('SELECT 1 + 1 AS solution');
-    res.json({
-      dbConnected: true,
-      dbSolution: dbRows[0].solution,
-      railwayPort: process.env.RAILWAY_PORT,
-      appPort: process.env.PORT,
-      host: process.env.DB_HOST,
-      time: new Date()
-    });
-  } catch (err) {
-    res.status(500).json({
-      dbConnected: false,
-      error: err.message,
-      stack: err.stack
-    });
-  }
 });
 
 // Test DB endpoint
-app.get('/api/testdb', async (req, res) => {
-  if (!db.isReady()) {
-    return res.status(500).json({ success: false, error: 'Database not ready' });
-  }
-  
+app.get('/api/testdb', checkDbReady, async (req, res) => {
   try {
     const [rows] = await db.query('SELECT NOW() AS now, CONNECTION_ID() AS conn_id');
     res.json({ 
@@ -216,9 +209,7 @@ app.get('/api/testdb', async (req, res) => {
 });
 
 // Register
-app.post('/api/register', async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
-  
+app.post('/api/register', checkDbReady, async (req, res) => {
   const { username, email, phone, password, referral_code } = req.body;
   if (!username || !email || !phone || !password) return res.status(400).json({ error: 'Missing fields' });
   const hashed = await bcrypt.hash(password, 10);
@@ -249,9 +240,7 @@ app.post('/api/register', async (req, res) => {
 });
 
 // Login
-app.post('/api/login', async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
-  
+app.post('/api/login', checkDbReady, async (req, res) => {
   const { usernameOrEmail, password } = req.body;
   if (!usernameOrEmail || !password) return res.status(400).json({ error: 'Missing fields' });
   const conn = await db.getPool().getConnection();
@@ -272,9 +261,7 @@ app.post('/api/login', async (req, res) => {
 });
 
 // Get current user
-app.get('/api/user', authenticate, async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
-  
+app.get('/api/user', authenticate, checkDbReady, async (req, res) => {
   const conn = await db.getPool().getConnection();
   try {
     const [rows] = await conn.query('SELECT id, username, email, phone, balance, current_vip_level, referral_code FROM users WHERE id=?', [req.user.id]);
@@ -287,15 +274,13 @@ app.get('/api/user', authenticate, async (req, res) => {
 });
 
 // Current balance
-app.get('/api/balance', authenticate, async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+app.get('/api/balance', authenticate, checkDbReady, async (req, res) => {
   const [[row]] = await db.query('SELECT balance FROM users WHERE id=?', [req.user.id]);
   res.json({ balance: Number(row?.balance || 0) });
 });
 
-// All transactions (optional type filter: recharge|withdrawal|vip_purchase|earning|referral_bonus)
-app.get('/api/transactions', authenticate, async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+// All transactions
+app.get('/api/transactions', authenticate, checkDbReady, async (req, res) => {
   const { type } = req.query;
   const params = [req.user.id];
   let sql = 'SELECT id, type, amount, status, details, account_number, account_name, receipt_url, notes, created_at FROM transactions WHERE user_id=?';
@@ -309,8 +294,7 @@ app.get('/api/transactions', authenticate, async (req, res) => {
 });
 
 // Recharge history
-app.get('/api/recharge-history', authenticate, async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+app.get('/api/recharge-history', authenticate, checkDbReady, async (req, res) => {
   const [rows] = await db.query(
     `SELECT id, amount, status, receipt_url, account_number, account_name, created_at 
      FROM transactions 
@@ -322,8 +306,7 @@ app.get('/api/recharge-history', authenticate, async (req, res) => {
 });
 
 // Withdrawal history
-app.get('/api/withdrawal-history', authenticate, async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+app.get('/api/withdrawal-history', authenticate, checkDbReady, async (req, res) => {
   const [rows] = await db.query(
     `SELECT id, amount, status, details, created_at 
      FROM transactions 
@@ -335,8 +318,7 @@ app.get('/api/withdrawal-history', authenticate, async (req, res) => {
 });
 
 // Change password
-app.post('/api/change-password', authenticate, async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+app.post('/api/change-password', authenticate, checkDbReady, async (req, res) => {
   const { old_password, new_password, confirm_password } = req.body;
   if (!old_password || !new_password || !confirm_password) return res.status(400).json({ error: 'Missing fields' });
   if (new_password !== confirm_password) return res.status(400).json({ error: 'Passwords do not match' });
@@ -353,9 +335,7 @@ app.post('/api/change-password', authenticate, async (req, res) => {
 });
 
 // Get VIP levels
-app.get('/api/vip-levels', async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
-  
+app.get('/api/vip-levels', checkDbReady, async (req, res) => {
   const conn = await db.getPool().getConnection();
   try {
     const [rows] = await conn.query('SELECT id, level, price, daily_earnings, earning_days FROM vip_levels ORDER BY level ASC');
@@ -367,16 +347,14 @@ app.get('/api/vip-levels', async (req, res) => {
   }
 });
 
-// Include withdrawal rules in VIP levels response (so frontend can render the table)
-app.get('/api/vip-levels-with-rules', async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+// Include withdrawal rules in VIP levels response
+app.get('/api/vip-levels-with-rules', checkDbReady, async (req, res) => {
   const [rows] = await db.query('SELECT id, level, price, daily_earnings, earning_days, withdrawal_rules FROM vip_levels ORDER BY level ASC');
   res.json(rows);
 });
 
 // Tasks / Lock status for withdrawals
-app.get('/api/tasks-status', authenticate, async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+app.get('/api/tasks-status', authenticate, checkDbReady, async (req, res) => {
   const userId = req.user.id;
 
   const [[wCount]] = await db.query(
@@ -398,17 +376,14 @@ app.get('/api/tasks-status', authenticate, async (req, res) => {
   });
 });
 
-// Announcements (menu speaker icon)
-app.get('/api/announcement', async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+// Announcements
+app.get('/api/announcement', checkDbReady, async (req, res) => {
   const [[row]] = await db.query('SELECT id, content, updated_at FROM announcements ORDER BY id ASC LIMIT 1');
   res.json(row || { content: '' });
 });
 
-// Admin: add VIP (x-admin-secret header)
-app.post('/api/vip-levels', async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
-  
+// Admin: add VIP
+app.post('/api/vip-levels', checkDbReady, async (req, res) => {
   const adminSecret = req.headers['x-admin-secret'];
   if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
   const { level, price, daily_earnings, earning_days, withdrawal_rules } = req.body;
@@ -426,8 +401,7 @@ app.post('/api/vip-levels', async (req, res) => {
 });
 
 // Admin: update announcement
-app.put('/admin/announcement', async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+app.put('/admin/announcement', checkDbReady, async (req, res) => {
   const adminSecret = req.headers['x-admin-secret'];
   if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
   const { content } = req.body;
@@ -443,8 +417,7 @@ app.put('/admin/announcement', async (req, res) => {
 });
 
 // Admin: list users
-app.get('/admin/users', async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+app.get('/admin/users', checkDbReady, async (req, res) => {
   const adminSecret = req.headers['x-admin-secret'];
   if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
 
@@ -452,9 +425,8 @@ app.get('/admin/users', async (req, res) => {
   res.json(rows);
 });
 
-// Admin: adjust balance (delta or set)
-app.patch('/admin/users/:id/balance', async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+// Admin: adjust balance
+app.patch('/admin/users/:id/balance', checkDbReady, async (req, res) => {
   const adminSecret = req.headers['x-admin-secret'];
   if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
 
@@ -465,17 +437,40 @@ app.patch('/admin/users/:id/balance', async (req, res) => {
     return res.status(400).json({ error: 'Provide delta or set' });
   }
 
-  if (typeof set === 'number') {
-    await db.query('UPDATE users SET balance=? WHERE id=?', [set, userId]);
-  } else {
-    await db.query('UPDATE users SET balance=balance+? WHERE id=?', [delta, userId]);
+  const conn = await db.getPool().getConnection();
+  try {
+    await conn.beginTransaction();
+    
+    if (typeof set === 'number') {
+      // Ensure balance doesn't go negative
+      if (set < 0) {
+        await conn.rollback();
+        return res.status(400).json({ error: 'Balance cannot be negative' });
+      }
+      await conn.query('UPDATE users SET balance=? WHERE id=?', [set, userId]);
+    } else {
+      // Check if the delta would make balance negative
+      const [[user]] = await conn.query('SELECT balance FROM users WHERE id=? FOR UPDATE', [userId]);
+      const newBalance = Number(user.balance) + delta;
+      if (newBalance < 0) {
+        await conn.rollback();
+        return res.status(400).json({ error: 'Balance cannot be negative' });
+      }
+      await conn.query('UPDATE users SET balance=balance+? WHERE id=?', [delta, userId]);
+    }
+    
+    await conn.commit();
+    res.json({ message: 'Balance updated' });
+  } catch (e) {
+    await conn.rollback();
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    conn.release();
   }
-  res.json({ message: 'Balance updated' });
 });
 
 // Admin: get user details with transactions and referrals
-app.get('/admin/users/:id/details', async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+app.get('/admin/users/:id/details', checkDbReady, async (req, res) => {
   const adminSecret = req.headers['x-admin-secret'];
   if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
 
@@ -528,9 +523,7 @@ app.get('/admin/users/:id/details', async (req, res) => {
 });
 
 // Purchase VIP
-app.post('/api/purchase-vip', authenticate, async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
-  
+app.post('/api/purchase-vip', authenticate, checkDbReady, async (req, res) => {
   const userId = req.user.id;
   const { vip_level_id } = req.body;
   if (!vip_level_id) return res.status(400).json({ error: 'vip_level_id required' });
@@ -563,24 +556,21 @@ app.post('/api/purchase-vip', authenticate, async (req, res) => {
   }
 });
 
-// Recharge (user submits → pending; admin will approve/reject)
-app.post('/api/recharge', authenticate, upload.single('receipt'), async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
-
+// Recharge
+app.post('/api/recharge', authenticate, upload.single('receipt'), checkDbReady, async (req, res) => {
   const userId = req.user.id;
   const amountRaw = req.body.amount;
   const account_number = (req.body.account_number || '').trim();
   const account_name = (req.body.account_name || '').trim();
 
   const amt = Number(amountRaw);
-  if (!amt || amt < 1000) { // platform min 1000 PKR
+  if (!amt || amt < 1000) {
     return res.status(400).json({ error: 'Amount must be at least 1000 PKR' });
   }
   if (!account_number || !account_name) {
     return res.status(400).json({ error: 'Account number and account name are required' });
   }
 
-  // Check if file was uploaded
   if (!req.file) {
     return res.status(400).json({ error: 'Receipt is required' });
   }
@@ -589,12 +579,10 @@ app.post('/api/recharge', authenticate, upload.single('receipt'), async (req, re
   try {
     await conn.beginTransaction();
 
-    // Store file in database as BLOB
     const receiptBuffer = req.file.buffer;
     const fileName = req.file.originalname;
     const fileType = req.file.mimetype;
 
-    // Insert transaction with receipt stored in database
     await conn.query(
       `INSERT INTO transactions 
        (user_id, type, amount, status, details, account_number, account_name, receipt_data, receipt_filename, receipt_type)
@@ -617,9 +605,7 @@ app.post('/api/recharge', authenticate, upload.single('receipt'), async (req, re
 });
 
 // Withdraw
-app.post('/api/withdraw', authenticate, async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
-  
+app.post('/api/withdraw', authenticate, checkDbReady, async (req, res) => {
   const userId = req.user.id;
   const { account_number, account_name, amount } = req.body;
   const amt = Number(amount);
@@ -630,18 +616,27 @@ app.post('/api/withdraw', authenticate, async (req, res) => {
     const [[user]] = await conn.query('SELECT balance, current_vip_level FROM users WHERE id=? FOR UPDATE', [userId]);
     if (!user) throw new Error('User not found');
     if (Number(user.balance) < amt) throw new Error('Insufficient balance');
+    
+    // Additional check to prevent negative balance after fee deduction
     const [vrRow] = await conn.query('SELECT withdrawal_rules FROM vip_levels WHERE level=?', [user.current_vip_level || 0]);
     const rules = parseWithdrawalRules(vrRow && vrRow.length ? vrRow[0].withdrawal_rules : '{}');
     const [countRow] = await conn.query("SELECT COUNT(*) as cnt FROM transactions WHERE user_id=? AND type='withdrawal' AND status='approved'", [userId]);
     const withdrawalCount = countRow[0].cnt || 0;
     const applicable = rules[String(withdrawalCount + 1)] || rules.default || { amount: 10000, fee_rate: 0.15 };
     if (amt > Number(applicable.amount)) throw new Error(`Maximum withdrawal for this request is Rs ${applicable.amount}`);
+    
+    const fee = Math.round(amt * Number(applicable.fee_rate || 0.15) * 100) / 100;
+    const net = Math.round((amt - fee) * 100) / 100;
+    
+    // Final balance check to ensure no negative balance
+    const finalBalance = Number(user.balance) - amt;
+    if (finalBalance < 0) throw new Error('Insufficient balance after fee calculation');
+    
     if (withdrawalCount >= 2) {
       const [rCount] = await conn.query('SELECT COUNT(*) as cnt FROM referrals WHERE referrer_id=?', [userId]);
       if (rCount[0].cnt < 3) throw new Error('Complete referral tasks first');
     }
-    const fee = Math.round(amt * Number(applicable.fee_rate || 0.15) * 100) / 100;
-    const net = Math.round((amt - fee) * 100) / 100;
+    
     await conn.query('UPDATE users SET balance = balance - ? WHERE id=?', [amt, userId]);
     await conn.query("INSERT INTO transactions (user_id, type, amount, status, details) VALUES (?, 'withdrawal', ?, 'pending', ?)", [userId, amt, `Acct:${account_number}|Name:${account_name}|Fee:${fee}|Net:${net}`]);
     await conn.commit();
@@ -661,9 +656,7 @@ app.post('/api/withdraw', authenticate, async (req, res) => {
 });
 
 // Team
-app.get('/api/team', authenticate, async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
-  
+app.get('/api/team', authenticate, checkDbReady, async (req, res) => {
   const userId = req.user.id;
   const conn = await db.getPool().getConnection();
   try {
@@ -688,9 +681,7 @@ app.get('/api/team', authenticate, async (req, res) => {
 });
 
 // Admin: list withdrawals
-app.get('/admin/withdrawals', async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
-  
+app.get('/admin/withdrawals', checkDbReady, async (req, res) => {
   const adminSecret = req.headers['x-admin-secret'];
   if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
   const conn = await db.getPool().getConnection();
@@ -705,8 +696,7 @@ app.get('/admin/withdrawals', async (req, res) => {
 });
 
 // Admin: list recharges
-app.get('/admin/recharges', async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+app.get('/admin/recharges', checkDbReady, async (req, res) => {
   const adminSecret = req.headers['x-admin-secret'];
   if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
 
@@ -730,7 +720,7 @@ app.get('/admin/recharges', async (req, res) => {
 });
 
 // Admin: view receipt
-app.get('/admin/receipt/:transactionId', async (req, res) => {
+app.get('/admin/receipt/:transactionId', checkDbReady, async (req, res) => {
   const adminSecret = req.headers['x-admin-secret'];
   if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
   
@@ -746,11 +736,9 @@ app.get('/admin/receipt/:transactionId', async (req, res) => {
       return res.status(404).json({ error: 'Receipt not found' });
     }
     
-    // Set appropriate headers
     res.setHeader('Content-Type', transaction.receipt_type);
     res.setHeader('Content-Disposition', `inline; filename="${transaction.receipt_filename}"`);
     
-    // Send the file data
     res.send(transaction.receipt_data);
   } catch (e) {
     res.status(500).json({ error: 'Server error' });
@@ -758,13 +746,12 @@ app.get('/admin/receipt/:transactionId', async (req, res) => {
 });
 
 // Admin: approve/reject a recharge
-app.put('/admin/recharges/:id', async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+app.put('/admin/recharges/:id', checkDbReady, async (req, res) => {
   const adminSecret = req.headers['x-admin-secret'];
   if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
 
   const id = req.params.id;
-  const { status, notes } = req.body; // status: 'approved' | 'rejected'
+  const { status, notes } = req.body;
   if (!['approved', 'rejected'].includes(status)) {
     return res.status(400).json({ error: 'Invalid status' });
   }
@@ -787,15 +774,13 @@ app.put('/admin/recharges/:id', async (req, res) => {
     }
 
     if (status === 'approved') {
-      // Credit user balance
       await conn.query('UPDATE users SET balance = balance + ? WHERE id=?', [trx.amount, trx.user_id]);
 
-      // First recharge referral bonus (8%) — pay only if this is the user's first APPROVED recharge
       const [[countRow]] = await conn.query(
         "SELECT COUNT(*) AS cnt FROM transactions WHERE user_id=? AND type='recharge' AND status='approved'",
         [trx.user_id]
       );
-      const wasZeroBefore = Number(countRow.cnt) === 0; // prior to this approval
+      const wasZeroBefore = Number(countRow.cnt) === 0;
       if (wasZeroBefore) {
         const [[refRow]] = await conn.query('SELECT referrer_id, first_recharge_bonus_paid FROM referrals WHERE referred_id=? FOR UPDATE', [trx.user_id]);
         if (refRow && refRow.referrer_id && !refRow.first_recharge_bonus_paid) {
@@ -821,11 +806,10 @@ app.put('/admin/recharges/:id', async (req, res) => {
   }
 });
 
-app.put('/admin/withdrawals/:id', async (req, res) => {
-  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
-  
+app.put('/admin/withdrawals/:id', checkDbReady, async (req, res) => {
   const adminSecret = req.headers['x-admin-secret'];
   if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
+  
   const id = req.params.id;
   const { status } = req.body;
   if (!['approved','rejected'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
@@ -852,9 +836,9 @@ app.put('/admin/withdrawals/:id', async (req, res) => {
 // ============================
 // CRON JOBS
 // ============================
-// Daily earnings cron job
+// Daily earnings cron job - Enhanced to prevent earnings from expired VIPs
 cron.schedule('10 0 * * *', async () => {
-  if (!db.isReady()) {
+  if (!dbInitialized) {
     logger.error('Daily earnings failed: Database not ready');
     return;
   }
@@ -862,21 +846,23 @@ cron.schedule('10 0 * * *', async () => {
   const conn = await db.getPool().getConnection();
   try {
     await conn.beginTransaction();
+    
+    // First, deactivate any expired VIP purchases
+    await conn.query('UPDATE user_vip_purchases SET active = 0 WHERE expiry_date < CURDATE() AND active = 1');
+    
+    // Then process earnings only for active, non-expired VIP purchases
     const [rows] = await conn.query(
-      `SELECT p.user_id, v.daily_earnings, p.id as purchase_id, p.expiry_date
+      `SELECT p.user_id, v.daily_earnings, p.id as purchase_id
        FROM user_vip_purchases p
        JOIN vip_levels v ON p.vip_level_id = v.id
-       WHERE p.active = 1`
+       WHERE p.active = 1 AND p.expiry_date >= CURDATE()`
     );
-    const now = new Date();
+    
     for (const r of rows) {
-      if (new Date(r.expiry_date) < now) {
-        await conn.query('UPDATE user_vip_purchases SET active=0 WHERE id=?', [r.purchase_id]);
-        continue;
-      }
       await conn.query('UPDATE users SET balance = balance + ? WHERE id=?', [r.daily_earnings, r.user_id]);
       await conn.query("INSERT INTO transactions (user_id, type, amount, status, details) VALUES (?, 'earning', ?, 'approved', 'Daily VIP earnings')", [r.user_id, r.daily_earnings]);
     }
+    
     await conn.commit();
     logger.info('✅ Daily earnings processed successfully');
   } catch (e) {
@@ -887,11 +873,16 @@ cron.schedule('10 0 * * *', async () => {
   }
 }, { timezone: 'UTC' });
 
-// VIP expiration cron job (runs every midnight)
-cron.schedule("0 0 * * *", async () => {
+// VIP expiration cron job - FIXED to use active column
+cron.schedule("5 0 * * *", async () => {
+  if (!dbInitialized) {
+    logger.error('VIP expiration failed: Database not ready');
+    return;
+  }
+  
   try {
     await db.query(
-      "UPDATE user_vip_purchases SET status = 'expired' WHERE expiry_date < NOW() AND status = 'active'"
+      "UPDATE user_vip_purchases SET active = 0 WHERE expiry_date < CURDATE() AND active = 1"
     );
     logger.info("Expired VIPs updated.");
   } catch (err) {
@@ -900,31 +891,48 @@ cron.schedule("0 0 * * *", async () => {
 }, { timezone: 'UTC' });
 
 // ============================
-// START SERVER (Railway optimized)
+// START SERVER
 // ============================
-// Critical fix: Use Railway's required port (8080)
 const PORT = process.env.PORT || 3001;
-const RAILWAY_PORT = process.env.RAILWAY_PORT || 8080;
 const HOST = '0.0.0.0';
 
-// Start server on Railway's required port
-const server = app.listen(RAILWAY_PORT, HOST, () => {
-  logger.info(`🚀 API listening on ${HOST}:${RAILWAY_PORT} (Railway required port)`);
-  logger.info(`🔌 Application port is ${PORT} (for internal routing)`);
-});
+// Initialize the application and start the server
+const startServer = async () => {
+  try {
+    // Initialize database first
+    const dbSuccess = await initializeApp();
+    
+    if (!dbSuccess) {
+      logger.error("Failed to initialize database, shutting down");
+      process.exit(1);
+    }
+    
+    // Start server on the correct port
+    const server = app.listen(PORT, HOST, () => {
+      logger.info(`🚀 API listening on ${HOST}:${PORT}`);
+    });
+    
+    // Handle shutdown gracefully
+    process.on('SIGINT', () => {
+      logger.info('SIGINT received - shutting down');
+      shutdown(server);
+    });
 
-// Handle shutdown gracefully
-process.on('SIGINT', () => {
-  logger.info('SIGINT received - shutting down');
-  shutdown();
-});
+    process.on('SIGTERM', () => {
+      logger.info('SIGTERM received - shutting down');
+      shutdown(server);
+    });
+    
+    return server;
+  } catch (error) {
+    logger.error("Failed to start server:", error);
+    process.exit(1);
+  }
+};
 
-process.on('SIGTERM', () => {
-  logger.info('SIGTERM received - shutting down');
-  shutdown();
-});
-
-function shutdown() {
+function shutdown(server) {
+  logger.info('Starting shutdown process...');
+  
   server.close(() => {
     logger.info('HTTP server closed');
     
@@ -955,5 +963,13 @@ process.on('unhandledRejection', (reason, promise) => {
 // Log uncaught exceptions
 process.on('uncaughtException', (error) => {
   logger.error('Uncaught Exception:', error);
-  shutdown();
+  process.exit(1);
+});
+
+// Start the server
+startServer().then(server => {
+  logger.info("Server started successfully on port " + PORT);
+}).catch(error => {
+  logger.error("Failed to start server:", error);
+  process.exit(1);
 });
