@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+npm-debug.log
+
+# Version control
+.git
+.gitignore
+
+# Documentation
+README.md
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Test coverage
+.nyc_output
+coverage
+
+# Uploads directory
+uploads
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+
+# Build outputs
+dist/
+build/

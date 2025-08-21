@@ -1,0 +1,959 @@
+// server.js - MajicEarn backend (Railway optimized) with DB file storage
+require('dotenv').config();
+const express = require('express');
+const helmet = require('helmet');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const fs = require('fs');
+const path = require('path');
+const winston = require('winston');
+const cron = require('node-cron');
+const multer = require('multer');
+const db = require('./config/db'); // Import the new db module
+
+const app = express();
+
+// ============================
+// MULTER CONFIGURATION FOR MEMORY STORAGE
+// ============================
+// Store files in memory temporarily before saving to database
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 1024 * 1024 * 5 // 5MB limit
+  }
+});
+
+// ============================
+// PROXY CONFIGURATION (CRITICAL FOR RATE LIMITING)
+// ============================
+app.set('trust proxy', 1); // Trust Railway's proxy
+
+// ============================
+// MIDDLEWARE
+// ============================
+app.use(cors());
+app.use(helmet());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Rate limiter
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per window
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use(limiter);
+
+// Logger
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.Console(),
+    new winston.transports.File({ filename: 'error.log', level: 'error' }),
+    new winston.transports.File({ filename: 'combined.log' })
+  ]
+});
+
+// Log middleware
+app.use((req, res, next) => {
+  logger.info(`${req.method} ${req.url}`);
+  next();
+});
+
+// ============================
+// DATABASE SETUP USING NEW MODULE
+// ============================
+// Initialize database connection
+db.initializeDatabase()
+  .then(() => {
+    logger.info("✅ Database initialized successfully");
+    // Run migrations after successful connection
+    setTimeout(() => {
+      runMigrationsIfNeeded().catch(e => {
+        logger.error('❌ Migrations failed:', e.message);
+      });
+    }, 2000);
+  })
+  .catch(err => {
+    logger.error("❌ Database initialization failed:", err.message);
+  });
+
+// ============================
+// HELPER FUNCTIONS
+// ============================
+async function runMigrationsIfNeeded() {
+  if (!db.isReady()) {
+    logger.error("❌ Migration skipped: Database not ready");
+    return;
+  }
+  
+  if (process.env.AUTO_MIGRATE !== '1') {
+    return; // Silent return if migration disabled
+  }
+  
+  const schemaPath = path.join(__dirname, 'sql', 'schema.sql');
+  if (!fs.existsSync(schemaPath)) {
+    logger.error('❌ Migration skipped: schema.sql not found');
+    return;
+  }
+  
+  const sql = fs.readFileSync(schemaPath, 'utf8');
+  const statements = sql.split(/;\s*\n/).map(s => s.trim()).filter(Boolean);
+  const conn = await db.getPool().getConnection();
+  
+  try {
+    logger.info('🏃‍♂️ Running migrations...');
+    for (const stmt of statements) {
+      await conn.query(stmt);
+    }
+    logger.info('✅ Database schema migrated/ensured.');
+  } catch (e) {
+    logger.error('❌ Migration failed', e);
+  } finally {
+    conn.release();
+  }
+}
+
+function signJwt(payload) {
+  return jwt.sign(payload, process.env.JWT_SECRET || 'secret', { expiresIn: '7d' });
+}
+
+async function authenticate(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth) return res.status(401).json({ error: 'Missing token' });
+  const token = auth.split(' ')[1];
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+function parseWithdrawalRules(json) {
+  try {
+    return typeof json === 'string' ? JSON.parse(json) : (json || {});
+  } catch {
+    return { default: { amount: 10000, fee_rate: 0.15 } };
+  }
+}
+
+// ============================
+// ROUTES
+// ============================
+// Root route for Railway health checks
+app.get('/', (req, res) => {
+  res.json({
+    status: "ok",
+    message: "MajicEarn Backend is running",
+    time: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development'
+  });
+});
+
+// Enhanced Health check
+app.get('/api/health', (req, res) => {
+  const status = db.isReady() ? 'ok' : 'degraded';
+  res.json({ 
+    status,
+    uptime: process.uptime(),
+    db: db.isReady() ? 'connected' : 'disconnected',
+    time: new Date().toISOString()
+  });
+});
+
+// Temporary debug route
+app.get('/debug', async (req, res) => {
+  try {
+    const [dbRows] = await db.query('SELECT 1 + 1 AS solution');
+    res.json({
+      dbConnected: true,
+      dbSolution: dbRows[0].solution,
+      railwayPort: process.env.RAILWAY_PORT,
+      appPort: process.env.PORT,
+      host: process.env.DB_HOST,
+      time: new Date()
+    });
+  } catch (err) {
+    res.status(500).json({
+      dbConnected: false,
+      error: err.message,
+      stack: err.stack
+    });
+  }
+});
+
+// Test DB endpoint
+app.get('/api/testdb', async (req, res) => {
+  if (!db.isReady()) {
+    return res.status(500).json({ success: false, error: 'Database not ready' });
+  }
+  
+  try {
+    const [rows] = await db.query('SELECT NOW() AS now, CONNECTION_ID() AS conn_id');
+    res.json({ 
+      success: true, 
+      time: rows[0].now,
+      connectionId: rows[0].conn_id
+    });
+  } catch (err) {
+    logger.error('DB query failed:', err.message);
+    res.status(500).json({ 
+      success: false, 
+      error: err.message,
+      code: err.code
+    });
+  }
+});
+
+// Register
+app.post('/api/register', async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  
+  const { username, email, phone, password, referral_code } = req.body;
+  if (!username || !email || !phone || !password) return res.status(400).json({ error: 'Missing fields' });
+  const hashed = await bcrypt.hash(password, 10);
+  const refCode = referral_code || Math.random().toString(36).slice(2, 10).toUpperCase();
+
+  const conn = await db.getPool().getConnection();
+  try {
+    await conn.beginTransaction();
+    const [ins] = await conn.query('INSERT INTO users (username,email,phone,password,referral_code) VALUES (?,?,?,?,?)', [username, email, phone, hashed, refCode]);
+    const userId = ins.insertId;
+    if (referral_code) {
+      const [rows] = await conn.query('SELECT id FROM users WHERE referral_code=?', [referral_code]);
+      if (rows.length) {
+        await conn.query('INSERT INTO referrals (referrer_id, referred_id, referral_date) VALUES (?,?,CURDATE())', [rows[0].id, userId]);
+      }
+    }
+    await conn.commit();
+    const token = signJwt({ id: userId, username });
+    res.status(201).json({ token });
+  } catch (e) {
+    await conn.rollback();
+    if (e.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Duplicate entry' });
+    logger.error('register failed', { error: e.stack });
+    res.status(500).json({ error: 'Server error', code: e.code });
+  } finally {
+    conn.release();
+  }
+});
+
+// Login
+app.post('/api/login', async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  
+  const { usernameOrEmail, password } = req.body;
+  if (!usernameOrEmail || !password) return res.status(400).json({ error: 'Missing fields' });
+  const conn = await db.getPool().getConnection();
+  try {
+    const [rows] = await conn.query('SELECT * FROM users WHERE username=? OR email=?', [usernameOrEmail, usernameOrEmail]);
+    if (!rows.length) return res.status(401).json({ error: 'Invalid credentials' });
+    const user = rows[0];
+    const ok = await bcrypt.compare(password, user.password);
+    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    const token = signJwt({ id: user.id, username: user.username, referral_code: user.referral_code });
+    res.json({ token });
+  } catch (e) {
+    logger.error('login failed', { error: e.stack });
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    conn.release();
+  }
+});
+
+// Get current user
+app.get('/api/user', authenticate, async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  
+  const conn = await db.getPool().getConnection();
+  try {
+    const [rows] = await conn.query('SELECT id, username, email, phone, balance, current_vip_level, referral_code FROM users WHERE id=?', [req.user.id]);
+    res.json(rows[0] || null);
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    conn.release();
+  }
+});
+
+// Current balance
+app.get('/api/balance', authenticate, async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  const [[row]] = await db.query('SELECT balance FROM users WHERE id=?', [req.user.id]);
+  res.json({ balance: Number(row?.balance || 0) });
+});
+
+// All transactions (optional type filter: recharge|withdrawal|vip_purchase|earning|referral_bonus)
+app.get('/api/transactions', authenticate, async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  const { type } = req.query;
+  const params = [req.user.id];
+  let sql = 'SELECT id, type, amount, status, details, account_number, account_name, receipt_url, notes, created_at FROM transactions WHERE user_id=?';
+  if (type) {
+    sql += ' AND type = ?';
+    params.push(type);
+  }
+  sql += ' ORDER BY created_at DESC';
+  const [rows] = await db.query(sql, params);
+  res.json(rows);
+});
+
+// Recharge history
+app.get('/api/recharge-history', authenticate, async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  const [rows] = await db.query(
+    `SELECT id, amount, status, receipt_url, account_number, account_name, created_at 
+     FROM transactions 
+     WHERE user_id=? AND type='recharge' 
+     ORDER BY created_at DESC`,
+    [req.user.id]
+  );
+  res.json(rows);
+});
+
+// Withdrawal history
+app.get('/api/withdrawal-history', authenticate, async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  const [rows] = await db.query(
+    `SELECT id, amount, status, details, created_at 
+     FROM transactions 
+     WHERE user_id=? AND type='withdrawal' 
+     ORDER BY created_at DESC`,
+    [req.user.id]
+  );
+  res.json(rows);
+});
+
+// Change password
+app.post('/api/change-password', authenticate, async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  const { old_password, new_password, confirm_password } = req.body;
+  if (!old_password || !new_password || !confirm_password) return res.status(400).json({ error: 'Missing fields' });
+  if (new_password !== confirm_password) return res.status(400).json({ error: 'Passwords do not match' });
+
+  const [[user]] = await db.query('SELECT id, password FROM users WHERE id=?', [req.user.id]);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  const ok = await bcrypt.compare(old_password, user.password);
+  if (!ok) return res.status(400).json({ error: 'Old password incorrect' });
+
+  const hashed = await bcrypt.hash(new_password, 10);
+  await db.query('UPDATE users SET password=? WHERE id=?', [hashed, req.user.id]);
+  res.json({ message: 'Password updated' });
+});
+
+// Get VIP levels
+app.get('/api/vip-levels', async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  
+  const conn = await db.getPool().getConnection();
+  try {
+    const [rows] = await conn.query('SELECT id, level, price, daily_earnings, earning_days FROM vip_levels ORDER BY level ASC');
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    conn.release();
+  }
+});
+
+// Include withdrawal rules in VIP levels response (so frontend can render the table)
+app.get('/api/vip-levels-with-rules', async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  const [rows] = await db.query('SELECT id, level, price, daily_earnings, earning_days, withdrawal_rules FROM vip_levels ORDER BY level ASC');
+  res.json(rows);
+});
+
+// Tasks / Lock status for withdrawals
+app.get('/api/tasks-status', authenticate, async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  const userId = req.user.id;
+
+  const [[wCount]] = await db.query(
+    "SELECT COUNT(*) AS cnt FROM transactions WHERE user_id=? AND type='withdrawal' AND status='approved'",
+    [userId]
+  );
+  const [[rCount]] = await db.query('SELECT COUNT(*) AS cnt FROM referrals WHERE referrer_id=?', [userId]);
+
+  // Your rule: 3rd+ withdrawals require 3 referrals
+  const needsReferrals = Number(wCount.cnt) >= 2;
+  const hasEnoughReferrals = Number(rCount.cnt) >= 3;
+
+  res.json({
+    current_vip_level: req.user.current_vip_level || 0,
+    approved_withdrawals: Number(wCount.cnt),
+    referrals_count: Number(rCount.cnt),
+    withdrawal_locked: needsReferrals && !hasEnoughReferrals,
+    requirement: needsReferrals ? '3 referrals required (1 ≥ your level, 2 any level)' : 'None'
+  });
+});
+
+// Announcements (menu speaker icon)
+app.get('/api/announcement', async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  const [[row]] = await db.query('SELECT id, content, updated_at FROM announcements ORDER BY id ASC LIMIT 1');
+  res.json(row || { content: '' });
+});
+
+// Admin: add VIP (x-admin-secret header)
+app.post('/api/vip-levels', async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  
+  const adminSecret = req.headers['x-admin-secret'];
+  if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
+  const { level, price, daily_earnings, earning_days, withdrawal_rules } = req.body;
+  if (!level || !price || !daily_earnings || !earning_days) return res.status(400).json({ error: 'Missing fields' });
+  const conn = await db.getPool().getConnection();
+  try {
+    await conn.query('INSERT INTO vip_levels (level, price, daily_earnings, earning_days, withdrawal_rules) VALUES (?,?,?,?,?)', [level, price, daily_earnings, earning_days, JSON.stringify(withdrawal_rules || {})]);
+    res.status(201).json({ message: 'VIP level added' });
+  } catch (e) {
+    logger.error('add vip failed', { error: e.stack });
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    conn.release();
+  }
+});
+
+// Admin: update announcement
+app.put('/admin/announcement', async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  const adminSecret = req.headers['x-admin-secret'];
+  if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
+  const { content } = req.body;
+  if (typeof content !== 'string') return res.status(400).json({ error: 'content required' });
+
+  const [[row]] = await db.query('SELECT id FROM announcements ORDER BY id ASC LIMIT 1');
+  if (row) {
+    await db.query('UPDATE announcements SET content=? WHERE id=?', [content, row.id]);
+  } else {
+    await db.query('INSERT INTO announcements (content) VALUES (?)', [content]);
+  }
+  res.json({ message: 'Announcement updated' });
+});
+
+// Admin: list users
+app.get('/admin/users', async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  const adminSecret = req.headers['x-admin-secret'];
+  if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
+
+  const [rows] = await db.query('SELECT id, username, email, phone, balance, current_vip_level, referral_code, created_at FROM users ORDER by id DESC');
+  res.json(rows);
+});
+
+// Admin: adjust balance (delta or set)
+app.patch('/admin/users/:id/balance', async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  const adminSecret = req.headers['x-admin-secret'];
+  if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
+
+  const userId = req.params.id;
+  const { delta, set } = req.body;
+
+  if (typeof delta !== 'number' && typeof set !== 'number') {
+    return res.status(400).json({ error: 'Provide delta or set' });
+  }
+
+  if (typeof set === 'number') {
+    await db.query('UPDATE users SET balance=? WHERE id=?', [set, userId]);
+  } else {
+    await db.query('UPDATE users SET balance=balance+? WHERE id=?', [delta, userId]);
+  }
+  res.json({ message: 'Balance updated' });
+});
+
+// Admin: get user details with transactions and referrals
+app.get('/admin/users/:id/details', async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  const adminSecret = req.headers['x-admin-secret'];
+  if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
+
+  const userId = req.params.id;
+  try {
+    // Get user details
+    const [[user]] = await db.query(
+      'SELECT id, username, email, phone, balance, current_vip_level, referral_code, created_at FROM users WHERE id = ?',
+      [userId]
+    );
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Get user transactions
+    const [transactions] = await db.query(
+      'SELECT id, type, amount, status, details, account_number, account_name, receipt_url, notes, created_at FROM transactions WHERE user_id = ? ORDER BY created_at DESC',
+      [userId]
+    );
+
+    // Get user referrals
+    const [referrals] = await db.query(
+      `SELECT u.id, u.username, u.phone, r.referral_date, r.first_recharge_bonus_paid
+       FROM referrals r
+       JOIN users u ON r.referred_id = u.id
+       WHERE r.referrer_id = ?`,
+      [userId]
+    );
+
+    // Get user VIP purchases
+    const [vipPurchases] = await db.query(
+      `SELECT p.id, v.level, v.price, p.purchase_date, p.expiry_date, p.active
+       FROM user_vip_purchases p
+       JOIN vip_levels v ON p.vip_level_id = v.id
+       WHERE p.user_id = ?
+       ORDER BY p.purchase_date DESC`,
+      [userId]
+    );
+
+    res.json({
+      user,
+      transactions,
+      referrals,
+      vipPurchases
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Purchase VIP
+app.post('/api/purchase-vip', authenticate, async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  
+  const userId = req.user.id;
+  const { vip_level_id } = req.body;
+  if (!vip_level_id) return res.status(400).json({ error: 'vip_level_id required' });
+  const conn = await db.getPool().getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[vip]] = await conn.query('SELECT * FROM vip_levels WHERE id=?', [vip_level_id]);
+    if (!vip) throw new Error('VIP not found');
+    const [[user]] = await conn.query('SELECT id, balance, current_vip_level FROM users WHERE id=? FOR UPDATE', [userId]);
+    if (!user) throw new Error('User not found');
+    if (Number(user.balance) < Number(vip.price)) throw new Error('Insufficient balance');
+    await conn.query('UPDATE users SET balance = balance - ? WHERE id = ?', [vip.price, userId]);
+    await conn.query("INSERT INTO transactions (user_id, type, amount, status, details) VALUES (?, 'vip_purchase', ?, 'approved', ?)", [userId, vip.price, `Purchased VIP level ${vip.level}`]);
+    const purchaseDate = new Date();
+    const expiry = new Date(purchaseDate); expiry.setDate(expiry.getDate() + Number(vip.earning_days));
+    await conn.query('INSERT INTO user_vip_purchases (user_id, vip_level_id, purchase_date, expiry_date, active) VALUES (?,?,?,?,1)', [userId, vip_level_id, purchaseDate.toISOString().slice(0,10), expiry.toISOString().slice(0,10)]);
+    const [maxRow] = await conn.query(`SELECT MAX(v.level) as maxLevel FROM user_vip_purchases p JOIN vip_levels v ON p.vip_level_id = v.id WHERE p.user_id=? AND p.active=1`, [userId]);
+    const maxLevel = maxRow[0].maxLevel || 0;
+    if (maxLevel > (user.current_vip_level || 0)) {
+      await conn.query('UPDATE users SET current_vip_level=? WHERE id=?', [maxLevel, userId]);
+    }
+    await conn.commit();
+    res.json({ message: 'VIP purchased' });
+  } catch (e) {
+    await conn.rollback();
+    logger.error('purchase vip failed', { error: e.stack });
+    res.status(400).json({ error: e.message || 'Server error' });
+  } finally {
+    conn.release();
+  }
+});
+
+// Recharge (user submits → pending; admin will approve/reject)
+app.post('/api/recharge', authenticate, upload.single('receipt'), async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+
+  const userId = req.user.id;
+  const amountRaw = req.body.amount;
+  const account_number = (req.body.account_number || '').trim();
+  const account_name = (req.body.account_name || '').trim();
+
+  const amt = Number(amountRaw);
+  if (!amt || amt < 1000) { // platform min 1000 PKR
+    return res.status(400).json({ error: 'Amount must be at least 1000 PKR' });
+  }
+  if (!account_number || !account_name) {
+    return res.status(400).json({ error: 'Account number and account name are required' });
+  }
+
+  // Check if file was uploaded
+  if (!req.file) {
+    return res.status(400).json({ error: 'Receipt is required' });
+  }
+
+  const conn = await db.getPool().getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // Store file in database as BLOB
+    const receiptBuffer = req.file.buffer;
+    const fileName = req.file.originalname;
+    const fileType = req.file.mimetype;
+
+    // Insert transaction with receipt stored in database
+    await conn.query(
+      `INSERT INTO transactions 
+       (user_id, type, amount, status, details, account_number, account_name, receipt_data, receipt_filename, receipt_type)
+       VALUES (?, 'recharge', ?, 'pending', 'User submitted recharge', ?, ?, ?, ?, ?)`,
+      [userId, amt, account_number, account_name, receiptBuffer, fileName, fileType]
+    );
+
+    await conn.commit();
+    res.status(201).json({ 
+      message: 'Recharge submitted and is pending review. Approval usually takes up to 5 hours. Contact us on WhatsApp if needed.', 
+      amount: amt,
+      note: "Please keep your receipt safe for verification. Approval typically takes up to 5 hours."
+    });
+  } catch (e) {
+    await conn.rollback();
+    return res.status(500).json({ error: 'Server error: ' + e.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// Withdraw
+app.post('/api/withdraw', authenticate, async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  
+  const userId = req.user.id;
+  const { account_number, account_name, amount } = req.body;
+  const amt = Number(amount);
+  if (!account_number || !account_name || !amt || amt <= 0) return res.status(400).json({ error: 'Missing/invalid fields' });
+  const conn = await db.getPool().getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[user]] = await conn.query('SELECT balance, current_vip_level FROM users WHERE id=? FOR UPDATE', [userId]);
+    if (!user) throw new Error('User not found');
+    if (Number(user.balance) < amt) throw new Error('Insufficient balance');
+    const [vrRow] = await conn.query('SELECT withdrawal_rules FROM vip_levels WHERE level=?', [user.current_vip_level || 0]);
+    const rules = parseWithdrawalRules(vrRow && vrRow.length ? vrRow[0].withdrawal_rules : '{}');
+    const [countRow] = await conn.query("SELECT COUNT(*) as cnt FROM transactions WHERE user_id=? AND type='withdrawal' AND status='approved'", [userId]);
+    const withdrawalCount = countRow[0].cnt || 0;
+    const applicable = rules[String(withdrawalCount + 1)] || rules.default || { amount: 10000, fee_rate: 0.15 };
+    if (amt > Number(applicable.amount)) throw new Error(`Maximum withdrawal for this request is Rs ${applicable.amount}`);
+    if (withdrawalCount >= 2) {
+      const [rCount] = await conn.query('SELECT COUNT(*) as cnt FROM referrals WHERE referrer_id=?', [userId]);
+      if (rCount[0].cnt < 3) throw new Error('Complete referral tasks first');
+    }
+    const fee = Math.round(amt * Number(applicable.fee_rate || 0.15) * 100) / 100;
+    const net = Math.round((amt - fee) * 100) / 100;
+    await conn.query('UPDATE users SET balance = balance - ? WHERE id=?', [amt, userId]);
+    await conn.query("INSERT INTO transactions (user_id, type, amount, status, details) VALUES (?, 'withdrawal', ?, 'pending', ?)", [userId, amt, `Acct:${account_number}|Name:${account_name}|Fee:${fee}|Net:${net}`]);
+    await conn.commit();
+    res.json({ 
+      message: 'Withdrawal submitted', 
+      fee, 
+      net_amount: net,
+      note: "Withdrawal processing typically takes 24-48 hours. Contact us on WhatsApp for urgent queries."
+    });
+  } catch (e) {
+    await conn.rollback();
+    logger.error('withdraw failed', { error: e.stack });
+    res.status(400).json({ error: e.message || 'Server error' });
+  } finally {
+    conn.release();
+  }
+});
+
+// Team
+app.get('/api/team', authenticate, async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  
+  const userId = req.user.id;
+  const conn = await db.getPool().getConnection();
+  try {
+    const [members] = await conn.query(
+      `SELECT u.id, u.username, u.phone,
+              SUM(CASE WHEN t.type='recharge' AND t.status='approved' THEN t.amount ELSE 0 END) AS total_recharge,
+              SUM(CASE WHEN t.type='withdrawal' AND t.status IN ('pending','approved') THEN t.amount ELSE 0 END) AS total_withdrawal
+       FROM referrals r
+       JOIN users u ON r.referred_id = u.id
+       LEFT JOIN transactions t ON u.id = t.user_id
+       WHERE r.referrer_id = ?
+       GROUP BY u.id`, [userId]
+    );
+    const [[me]] = await conn.query('SELECT referral_code FROM users WHERE id=?', [userId]);
+    const [[earnRow]] = await conn.query("SELECT SUM(amount) as total FROM transactions WHERE user_id=? AND type='referral_bonus'", [userId]);
+    res.json({ referral_link: `${process.env.BASE_URL}/signup?ref=${me.referral_code}`, referral_earnings: Number(earnRow.total||0), team_members: members });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    conn.release();
+  }
+});
+
+// Admin: list withdrawals
+app.get('/admin/withdrawals', async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  
+  const adminSecret = req.headers['x-admin-secret'];
+  if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
+  const conn = await db.getPool().getConnection();
+  try {
+    const [rows] = await conn.query(`SELECT t.*, u.username, u.email, u.phone FROM transactions t JOIN users u ON t.user_id = u.id WHERE t.type='withdrawal' ORDER BY t.created_at DESC`);
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    conn.release();
+  }
+});
+
+// Admin: list recharges
+app.get('/admin/recharges', async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  const adminSecret = req.headers['x-admin-secret'];
+  if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
+
+  const conn = await db.getPool().getConnection();
+  try {
+    const [rows] = await conn.query(
+      `SELECT t.id, t.user_id, t.amount, t.status, t.account_number, t.account_name, 
+              t.receipt_filename, t.receipt_type, t.created_at, t.notes,
+              u.username, u.email, u.phone
+       FROM transactions t 
+       JOIN users u ON t.user_id = u.id
+       WHERE t.type='recharge'
+       ORDER BY t.created_at DESC`
+    );
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    conn.release();
+  }
+});
+
+// Admin: view receipt
+app.get('/admin/receipt/:transactionId', async (req, res) => {
+  const adminSecret = req.headers['x-admin-secret'];
+  if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
+  
+  const transactionId = req.params.transactionId;
+  
+  try {
+    const [[transaction]] = await db.query(
+      'SELECT receipt_data, receipt_type, receipt_filename FROM transactions WHERE id = ? AND type = "recharge"',
+      [transactionId]
+    );
+    
+    if (!transaction || !transaction.receipt_data) {
+      return res.status(404).json({ error: 'Receipt not found' });
+    }
+    
+    // Set appropriate headers
+    res.setHeader('Content-Type', transaction.receipt_type);
+    res.setHeader('Content-Disposition', `inline; filename="${transaction.receipt_filename}"`);
+    
+    // Send the file data
+    res.send(transaction.receipt_data);
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Admin: approve/reject a recharge
+app.put('/admin/recharges/:id', async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  const adminSecret = req.headers['x-admin-secret'];
+  if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
+
+  const id = req.params.id;
+  const { status, notes } = req.body; // status: 'approved' | 'rejected'
+  if (!['approved', 'rejected'].includes(status)) {
+    return res.status(400).json({ error: 'Invalid status' });
+  }
+
+  const conn = await db.getPool().getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [[trx]] = await conn.query(
+      'SELECT id, user_id, amount, status FROM transactions WHERE id=? AND type="recharge" FOR UPDATE',
+      [id]
+    );
+    if (!trx) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'Recharge not found' });
+    }
+    if (trx.status !== 'pending') {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Only pending recharges can be updated' });
+    }
+
+    if (status === 'approved') {
+      // Credit user balance
+      await conn.query('UPDATE users SET balance = balance + ? WHERE id=?', [trx.amount, trx.user_id]);
+
+      // First recharge referral bonus (8%) — pay only if this is the user's first APPROVED recharge
+      const [[countRow]] = await conn.query(
+        "SELECT COUNT(*) AS cnt FROM transactions WHERE user_id=? AND type='recharge' AND status='approved'",
+        [trx.user_id]
+      );
+      const wasZeroBefore = Number(countRow.cnt) === 0; // prior to this approval
+      if (wasZeroBefore) {
+        const [[refRow]] = await conn.query('SELECT referrer_id, first_recharge_bonus_paid FROM referrals WHERE referred_id=? FOR UPDATE', [trx.user_id]);
+        if (refRow && refRow.referrer_id && !refRow.first_recharge_bonus_paid) {
+          const bonus = Math.round(Number(trx.amount) * 0.08 * 100) / 100;
+          await conn.query('UPDATE users SET balance = balance + ? WHERE id=?', [bonus, refRow.referrer_id]);
+          await conn.query(
+            "INSERT INTO transactions (user_id, type, amount, status, details) VALUES (?, 'referral_bonus', ?, 'approved', 'First recharge referral bonus')",
+            [refRow.referrer_id, bonus]
+          );
+          await conn.query('UPDATE referrals SET first_recharge_bonus_paid=1 WHERE referred_id=?', [trx.user_id]);
+        }
+      }
+    }
+
+    await conn.query('UPDATE transactions SET status=?, notes=? WHERE id=?', [status, notes || null, id]);
+    await conn.commit();
+    res.json({ message: 'Recharge updated' });
+  } catch (e) {
+    await conn.rollback();
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    conn.release();
+  }
+});
+
+app.put('/admin/withdrawals/:id', async (req, res) => {
+  if (!db.isReady()) return res.status(500).json({ error: 'Database unavailable' });
+  
+  const adminSecret = req.headers['x-admin-secret'];
+  if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
+  const id = req.params.id;
+  const { status } = req.body;
+  if (!['approved','rejected'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
+  const conn = await db.getPool().getConnection();
+  try {
+    await conn.beginTransaction();
+    if (status === 'rejected') {
+      const [[trx]] = await conn.query('SELECT user_id, amount FROM transactions WHERE id=? AND type="withdrawal"', [id]);
+      if (trx) {
+        await conn.query('UPDATE users SET balance = balance + ? WHERE id=?', [trx.amount, trx.user_id]);
+      }
+    }
+    await conn.query('UPDATE transactions SET status=? WHERE id=?', [status, id]);
+    await conn.commit();
+    res.json({ message: 'Updated' });
+  } catch (e) {
+    await conn.rollback();
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    conn.release();
+  }
+});
+
+// ============================
+// CRON JOBS
+// ============================
+// Daily earnings cron job
+cron.schedule('10 0 * * *', async () => {
+  if (!db.isReady()) {
+    logger.error('Daily earnings failed: Database not ready');
+    return;
+  }
+  
+  const conn = await db.getPool().getConnection();
+  try {
+    await conn.beginTransaction();
+    const [rows] = await conn.query(
+      `SELECT p.user_id, v.daily_earnings, p.id as purchase_id, p.expiry_date
+       FROM user_vip_purchases p
+       JOIN vip_levels v ON p.vip_level_id = v.id
+       WHERE p.active = 1`
+    );
+    const now = new Date();
+    for (const r of rows) {
+      if (new Date(r.expiry_date) < now) {
+        await conn.query('UPDATE user_vip_purchases SET active=0 WHERE id=?', [r.purchase_id]);
+        continue;
+      }
+      await conn.query('UPDATE users SET balance = balance + ? WHERE id=?', [r.daily_earnings, r.user_id]);
+      await conn.query("INSERT INTO transactions (user_id, type, amount, status, details) VALUES (?, 'earning', ?, 'approved', 'Daily VIP earnings')", [r.user_id, r.daily_earnings]);
+    }
+    await conn.commit();
+    logger.info('✅ Daily earnings processed successfully');
+  } catch (e) {
+    await conn.rollback();
+    logger.error('daily earnings failed', { error: e.stack });
+  } finally {
+    conn.release();
+  }
+}, { timezone: 'UTC' });
+
+// VIP expiration cron job (runs every midnight)
+cron.schedule("0 0 * * *", async () => {
+  try {
+    await db.query(
+      "UPDATE user_vip_purchases SET status = 'expired' WHERE expiry_date < NOW() AND status = 'active'"
+    );
+    logger.info("Expired VIPs updated.");
+  } catch (err) {
+    logger.error("Error expiring VIPs:", err);
+  }
+}, { timezone: 'UTC' });
+
+// ============================
+// START SERVER (Railway optimized)
+// ============================
+// Critical fix: Use Railway's required port (8080)
+const PORT = process.env.PORT || 3001;
+const RAILWAY_PORT = process.env.RAILWAY_PORT || 8080;
+const HOST = '0.0.0.0';
+
+// Start server on Railway's required port
+const server = app.listen(RAILWAY_PORT, HOST, () => {
+  logger.info(`🚀 API listening on ${HOST}:${RAILWAY_PORT} (Railway required port)`);
+  logger.info(`🔌 Application port is ${PORT} (for internal routing)`);
+});
+
+// Handle shutdown gracefully
+process.on('SIGINT', () => {
+  logger.info('SIGINT received - shutting down');
+  shutdown();
+});
+
+process.on('SIGTERM', () => {
+  logger.info('SIGTERM received - shutting down');
+  shutdown();
+});
+
+function shutdown() {
+  server.close(() => {
+    logger.info('HTTP server closed');
+    
+    // Close database pool
+    if (db.getPool()) {
+      db.getPool().end(err => {
+        if (err) logger.error('Error closing database pool:', err);
+        else logger.info('Database pool closed');
+        process.exit(0);
+      });
+    } else {
+      process.exit(0);
+    }
+  });
+
+  // Force shutdown after timeout
+  setTimeout(() => {
+    logger.error('Could not close connections in time, forcefully shutting down');
+    process.exit(1);
+  }, 10000);
+}
+
+// Log unhandled rejections
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+// Log uncaught exceptions
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught Exception:', error);
+  shutdown();
+});

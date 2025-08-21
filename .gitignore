@@ -1,0 +1,49 @@
+# ---- Node.js backend .gitignore ----
+
+# 1) Environment files (keep secrets out of Git)
+.env
+.env.*
+!.env.example
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# 2) Dependencies
+node_modules/
+
+# 3) Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# 4) Test coverage
+coverage/
+.nyc_output/
+
+# 5) Build / temp outputs
+dist/
+build/
+tmp/
+temp/
+*.tmp
+
+# 6) Process id / runtime files
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# 7) OS / Editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# 8) Optional: local database files or uploads (uncomment if you create these)
+# data/
+# uploads/
