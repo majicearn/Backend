@@ -179,8 +179,8 @@ app.get('/', (req, res) => {
   });
 });
 
-// Health check endpoint
-app.get('/health', (req, res) {
+// Health check endpoint - FIXED SYNTAX ERROR
+app.get('/health', (req, res) => {
   res.status(200).json({ 
     status: 'OK', 
     timestamp: new Date().toISOString(),
@@ -338,7 +338,7 @@ app.post('/api/change-password', authenticate, checkDbReady, async (req, res) =>
 app.get('/api/vip-levels', checkDbReady, async (req, res) => {
   const conn = await db.getPool().getConnection();
   try {
-    const [rows] = await conn.query('SELECT id, level, price, daily_earnings, earning_days FROM vip_levels ORDER BY level ASC');
+    const [rows] = await conn.query('SELECT id, level, price, daily_earnings, earning_days FROM vip_levels ORDER by level ASC');
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: 'Server error' });
@@ -349,7 +349,7 @@ app.get('/api/vip-levels', checkDbReady, async (req, res) => {
 
 // Include withdrawal rules in VIP levels response
 app.get('/api/vip-levels-with-rules', checkDbReady, async (req, res) => {
-  const [rows] = await db.query('SELECT id, level, price, daily_earnings, earning_days, withdrawal_rules FROM vip_levels ORDER BY level ASC');
+  const [rows] = await db.query('SELECT id, level, price, daily_earnings, earning_days, withdrawal_rules FROM vip_levels ORDER by level ASC');
   res.json(rows);
 });
 
@@ -378,7 +378,7 @@ app.get('/api/tasks-status', authenticate, checkDbReady, async (req, res) => {
 
 // Announcements
 app.get('/api/announcement', checkDbReady, async (req, res) => {
-  const [[row]] = await db.query('SELECT id, content, updated_at FROM announcements ORDER BY id ASC LIMIT 1');
+  const [[row]] = await db.query('SELECT id, content, updated_at FROM announcements ORDER by id ASC LIMIT 1');
   res.json(row || { content: '' });
 });
 
@@ -407,7 +407,7 @@ app.put('/admin/announcement', checkDbReady, async (req, res) => {
   const { content } = req.body;
   if (typeof content !== 'string') return res.status(400).json({ error: 'content required' });
 
-  const [[row]] = await db.query('SELECT id FROM announcements ORDER BY id ASC LIMIT 1');
+  const [[row]] = await db.query('SELECT id FROM announcements ORDER by id ASC LIMIT 1');
   if (row) {
     await db.query('UPDATE announcements SET content=? WHERE id=?', [content, row.id]);
   } else {
@@ -488,7 +488,7 @@ app.get('/admin/users/:id/details', checkDbReady, async (req, res) => {
 
     // Get user transactions
     const [transactions] = await db.query(
-      'SELECT id, type, amount, status, details, account_number, account_name, receipt_url, notes, created_at FROM transactions WHERE user_id = ? ORDER BY created_at DESC',
+      'SELECT id, type, amount, status, details, account_number, account_name, receipt_url, notes, created_at FROM transactions WHERE user_id = ? ORDER by created_at DESC',
       [userId]
     );
 
@@ -507,7 +507,7 @@ app.get('/admin/users/:id/details', checkDbReady, async (req, res) => {
        FROM user_vip_purchases p
        JOIN vip_levels v ON p.vip_level_id = v.id
        WHERE p.user_id = ?
-       ORDER BY p.purchase_date DESC`,
+       ORDER by p.purchase_date DESC`,
       [userId]
     );
 
@@ -668,7 +668,7 @@ app.get('/api/team', authenticate, checkDbReady, async (req, res) => {
        JOIN users u ON r.referred_id = u.id
        LEFT JOIN transactions t ON u.id = t.user_id
        WHERE r.referrer_id = ?
-       GROUP BY u.id`, [userId]
+       GROUP by u.id`, [userId]
     );
     const [[me]] = await conn.query('SELECT referral_code FROM users WHERE id=?', [userId]);
     const [[earnRow]] = await conn.query("SELECT SUM(amount) as total FROM transactions WHERE user_id=? AND type='referral_bonus'", [userId]);
@@ -686,7 +686,7 @@ app.get('/admin/withdrawals', checkDbReady, async (req, res) => {
   if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
   const conn = await db.getPool().getConnection();
   try {
-    const [rows] = await conn.query(`SELECT t.*, u.username, u.email, u.phone FROM transactions t JOIN users u ON t.user_id = u.id WHERE t.type='withdrawal' ORDER BY t.created_at DESC`);
+    const [rows] = await conn.query(`SELECT t.*, u.username, u.email, u.phone FROM transactions t JOIN users u ON t.user_id = u.id WHERE t.type='withdrawal' ORDER by t.created_at DESC`);
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: 'Server error' });
@@ -709,7 +709,7 @@ app.get('/admin/recharges', checkDbReady, async (req, res) => {
        FROM transactions t 
        JOIN users u ON t.user_id = u.id
        WHERE t.type='recharge'
-       ORDER BY t.created_at DESC`
+       ORDER by t.created_at DESC`
     );
     res.json(rows);
   } catch (e) {
@@ -780,7 +780,7 @@ app.put('/admin/recharges/:id', checkDbReady, async (req, res) => {
         "SELECT COUNT(*) AS cnt FROM transactions WHERE user_id=? AND type='recharge' AND status='approved'",
         [trx.user_id]
       );
-      const wasZeroBefore = Number(countRow.cnt) === 0;
+  const wasZeroBefore = Number(countRow.cnt) === 0;
       if (wasZeroBefore) {
         const [[refRow]] = await conn.query('SELECT referrer_id, first_recharge_bonus_paid FROM referrals WHERE referred_id=? FOR UPDATE', [trx.user_id]);
         if (refRow && refRow.referrer_id && !refRow.first_recharge_bonus_paid) {
