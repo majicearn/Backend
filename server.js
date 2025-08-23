@@ -535,7 +535,7 @@ app.get('/admin/users/:id/details', checkDbReady, async (req, res) => {
   }
 });
 
-// Purchase VIP
+// Purchase VIP with 90-day validity and one purchase per level restriction
 app.post('/api/purchase-vip', authenticate, checkDbReady, async (req, res) => {
   const userId = req.user.id;
   const { vip_level_id } = req.body;
@@ -543,6 +543,17 @@ app.post('/api/purchase-vip', authenticate, checkDbReady, async (req, res) => {
   const conn = await db.getPool().getConnection();
   try {
     await conn.beginTransaction();
+    
+    // Check if user already has an active purchase of this VIP level
+    const [existingPurchases] = await conn.query(
+      'SELECT id FROM user_vip_purchases WHERE user_id = ? AND vip_level_id = ? AND active = 1 AND expiry_date >= CURDATE()',
+      [userId, vip_level_id]
+    );
+    
+    if (existingPurchases.length > 0) {
+      throw new Error('You already have an active purchase of this VIP level');
+    }
+    
     const [[vip]] = await conn.query('SELECT * FROM vip_levels WHERE id=?', [vip_level_id]);
     if (!vip) throw new Error('VIP not found');
     const [[user]] = await conn.query('SELECT id, balance, current_vip_level FROM users WHERE id=? FOR UPDATE', [userId]);
@@ -551,7 +562,9 @@ app.post('/api/purchase-vip', authenticate, checkDbReady, async (req, res) => {
     await conn.query('UPDATE users SET balance = balance - ? WHERE id = ?', [vip.price, userId]);
     await conn.query("INSERT INTO transactions (user_id, type, amount, status, details) VALUES (?, 'vip_purchase', ?, 'approved', ?)", [userId, vip.price, `Purchased VIP level ${vip.level}`]);
     const purchaseDate = new Date();
-    const expiry = new Date(purchaseDate); expiry.setDate(expiry.getDate() + Number(vip.earning_days));
+    const expiry = new Date(purchaseDate); 
+    expiry.setDate(expiry.getDate() + 90); // 90-day validity
+    
     await conn.query('INSERT INTO user_vip_purchases (user_id, vip_level_id, purchase_date, expiry_date, active) VALUES (?,?,?,?,1)', [userId, vip_level_id, purchaseDate.toISOString().slice(0,10), expiry.toISOString().slice(0,10)]);
     const [maxRow] = await conn.query(`SELECT MAX(v.level) as maxLevel FROM user_vip_purchases p JOIN vip_levels v ON p.vip_level_id = v.id WHERE p.user_id=? AND p.active=1`, [userId]);
     const maxLevel = maxRow[0].maxLevel || 0;
@@ -578,6 +591,17 @@ app.post('/api/vip/purchase', authenticate, checkDbReady, async (req, res) => {
   const conn = await db.getPool().getConnection();
   try {
     await conn.beginTransaction();
+    
+    // Check if user already has an active purchase of this VIP level
+    const [existingPurchases] = await conn.query(
+      'SELECT id FROM user_vip_purchases WHERE user_id = ? AND vip_level_id = ? AND active = 1 AND expiry_date >= CURDATE()',
+      [userId, vip_level_id]
+    );
+    
+    if (existingPurchases.length > 0) {
+      throw new Error('You already have an active purchase of this VIP level');
+    }
+    
     const [[vip]] = await conn.query('SELECT * FROM vip_levels WHERE id=?', [vip_level_id]);
     if (!vip) throw new Error('VIP not found');
     const [[user]] = await conn.query('SELECT id, balance, current_vip_level FROM users WHERE id=? FOR UPDATE', [userId]);
@@ -590,7 +614,7 @@ app.post('/api/vip/purchase', authenticate, checkDbReady, async (req, res) => {
     
     const purchaseDate = new Date();
     const expiry = new Date(purchaseDate); 
-    expiry.setDate(expiry.getDate() + Number(vip.earning_days));
+    expiry.setDate(expiry.getDate() + 90); // 90-day validity
     
     await conn.query('INSERT INTO user_vip_purchases (user_id, vip_level_id, purchase_date, expiry_date, active) VALUES (?,?,?,?,1)', 
       [userId, vip_level_id, purchaseDate.toISOString().slice(0,10), expiry.toISOString().slice(0,10)]);
@@ -661,7 +685,7 @@ app.post('/api/recharge', authenticate, upload.single('receipt'), checkDbReady, 
   }
 });
 
-// Withdraw - Enhanced with account locking and unique validation
+// Withdraw - Enhanced with account locking, unique validation, and VIP referral requirements
 app.post('/api/withdraw', authenticate, checkDbReady, async (req, res) => {
   const userId = req.user.id;
   const { account_number, account_name, amount } = req.body;
@@ -744,7 +768,24 @@ app.post('/api/withdraw', authenticate, checkDbReady, async (req, res) => {
     // Check referral requirement for 3rd+ withdrawals
     if (withdrawalCount >= 2) {
       const [rCount] = await conn.query('SELECT COUNT(*) as cnt FROM referrals WHERE referrer_id=?', [userId]);
-      if (rCount[0].cnt < 3) throw new Error('Complete referral tasks first. You need at least 3 referrals for additional withdrawals.');
+      if (rCount[0].cnt < 3) {
+        throw new Error('Complete referral tasks first. You need at least 3 referrals for additional withdrawals.');
+      }
+
+      // For VIP level 1 and above, check if at least one referral has VIP level equal or higher
+      if (user.current_vip_level >= 1) {
+        const [refRows] = await conn.query(
+          `SELECT u.current_vip_level 
+           FROM referrals r 
+           JOIN users u ON r.referred_id = u.id 
+           WHERE r.referrer_id = ?`,
+          [userId]
+        );
+        const hasEqualOrHigher = refRows.some(ref => ref.current_vip_level >= user.current_vip_level);
+        if (!hasEqualOrHigher) {
+          throw new Error(`For this withdrawal, you need at least one referral with VIP level ${user.current_vip_level} or higher.`);
+        }
+      }
     }
     
     // Calculate fee and net amount
