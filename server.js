@@ -273,6 +273,19 @@ app.get('/api/user', authenticate, checkDbReady, async (req, res) => {
   }
 });
 
+// Get user profile
+app.get('/api/user/profile', authenticate, checkDbReady, async (req, res) => {
+  const conn = await db.getPool().getConnection();
+  try {
+    const [rows] = await conn.query('SELECT id, username, email, phone, balance, current_vip_level, referral_code FROM users WHERE id=?', [req.user.id]);
+    res.json(rows[0] || null);
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    conn.release();
+  }
+});
+
 // Current balance
 app.get('/api/balance', authenticate, checkDbReady, async (req, res) => {
   const [[row]] = await db.query('SELECT balance FROM users WHERE id=?', [req.user.id]);
@@ -556,6 +569,50 @@ app.post('/api/purchase-vip', authenticate, checkDbReady, async (req, res) => {
   }
 });
 
+// VIP purchase endpoint (alias)
+app.post('/api/vip/purchase', authenticate, checkDbReady, async (req, res) => {
+  const userId = req.user.id;
+  const { vip_level_id } = req.body;
+  if (!vip_level_id) return res.status(400).json({ error: 'vip_level_id required' });
+  
+  const conn = await db.getPool().getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[vip]] = await conn.query('SELECT * FROM vip_levels WHERE id=?', [vip_level_id]);
+    if (!vip) throw new Error('VIP not found');
+    const [[user]] = await conn.query('SELECT id, balance, current_vip_level FROM users WHERE id=? FOR UPDATE', [userId]);
+    if (!user) throw new Error('User not found');
+    if (Number(user.balance) < Number(vip.price)) throw new Error('Insufficient balance');
+    
+    await conn.query('UPDATE users SET balance = balance - ? WHERE id = ?', [vip.price, userId]);
+    await conn.query("INSERT INTO transactions (user_id, type, amount, status, details) VALUES (?, 'vip_purchase', ?, 'approved', ?)", 
+      [userId, vip.price, `Purchased VIP level ${vip.level}`]);
+    
+    const purchaseDate = new Date();
+    const expiry = new Date(purchaseDate); 
+    expiry.setDate(expiry.getDate() + Number(vip.earning_days));
+    
+    await conn.query('INSERT INTO user_vip_purchases (user_id, vip_level_id, purchase_date, expiry_date, active) VALUES (?,?,?,?,1)', 
+      [userId, vip_level_id, purchaseDate.toISOString().slice(0,10), expiry.toISOString().slice(0,10)]);
+    
+    const [maxRow] = await conn.query(`SELECT MAX(v.level) as maxLevel FROM user_vip_purchases p JOIN vip_levels v ON p.vip_level_id = v.id WHERE p.user_id=? AND p.active=1`, [userId]);
+    const maxLevel = maxRow[0].maxLevel || 0;
+    
+    if (maxLevel > (user.current_vip_level || 0)) {
+      await conn.query('UPDATE users SET current_vip_level=? WHERE id=?', [maxLevel, userId]);
+    }
+    
+    await conn.commit();
+    res.json({ message: 'VIP purchased' });
+  } catch (e) {
+    await conn.rollback();
+    logger.error('purchase vip failed', { error: e.stack });
+    res.status(400).json({ error: e.message || 'Server error' });
+  } finally {
+    conn.release();
+  }
+});
+
 // Recharge
 app.post('/api/recharge', authenticate, upload.single('receipt'), checkDbReady, async (req, res) => {
   const userId = req.user.id;
@@ -604,52 +661,173 @@ app.post('/api/recharge', authenticate, upload.single('receipt'), checkDbReady, 
   }
 });
 
-// Withdraw
+// Withdraw - Enhanced with account locking and unique validation
 app.post('/api/withdraw', authenticate, checkDbReady, async (req, res) => {
   const userId = req.user.id;
   const { account_number, account_name, amount } = req.body;
   const amt = Number(amount);
-  if (!account_number || !account_name || !amt || amt <= 0) return res.status(400).json({ error: 'Missing/invalid fields' });
+  
+  if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount' });
+  
   const conn = await db.getPool().getConnection();
   try {
     await conn.beginTransaction();
-    const [[user]] = await conn.query('SELECT balance, current_vip_level FROM users WHERE id=? FOR UPDATE', [userId]);
+    
+    // Get user details with account info
+    const [[user]] = await conn.query(
+      'SELECT id, balance, current_vip_level, withdrawal_account_number, withdrawal_account_name FROM users WHERE id=? FOR UPDATE', 
+      [userId]
+    );
+    
     if (!user) throw new Error('User not found');
+    
+    // Check if user already has a saved account
+    let finalAccountNumber = user.withdrawal_account_number;
+    let finalAccountName = user.withdrawal_account_name;
+    
+    if (finalAccountNumber) {
+      // User already has an account saved - ignore provided values
+      if (account_number && account_number !== finalAccountNumber) {
+        throw new Error('Account number cannot be changed after first withdrawal');
+      }
+    } else {
+      // First withdrawal - validate and save account details
+      if (!account_number || !account_name) {
+        throw new Error('Account number and name are required for first withdrawal');
+      }
+      
+      // Check if account number is already used by another user
+      const [[existingAccount]] = await conn.query(
+        'SELECT id FROM users WHERE withdrawal_account_number = ? AND id != ?',
+        [account_number, userId]
+      );
+      
+      if (existingAccount) {
+        throw new Error('This account number is already registered by another user');
+      }
+      
+      // Save account details
+      await conn.query(
+        'UPDATE users SET withdrawal_account_number = ?, withdrawal_account_name = ? WHERE id = ?',
+        [account_number, account_name, userId]
+      );
+      
+      finalAccountNumber = account_number;
+      finalAccountName = account_name;
+    }
+    
+    // Check balance
     if (Number(user.balance) < amt) throw new Error('Insufficient balance');
     
-    // Additional check to prevent negative balance after fee deduction
-    const [vrRow] = await conn.query('SELECT withdrawal_rules FROM vip_levels WHERE level=?', [user.current_vip_level || 0]);
+    // Get withdrawal rules based on VIP level
+    const [vrRow] = await conn.query(
+      'SELECT withdrawal_rules FROM vip_levels WHERE level=?', 
+      [user.current_vip_level || 0]
+    );
+    
     const rules = parseWithdrawalRules(vrRow && vrRow.length ? vrRow[0].withdrawal_rules : '{}');
-    const [countRow] = await conn.query("SELECT COUNT(*) as cnt FROM transactions WHERE user_id=? AND type='withdrawal' AND status='approved'", [userId]);
+    
+    // Count previous approved withdrawals
+    const [countRow] = await conn.query(
+      "SELECT COUNT(*) as cnt FROM transactions WHERE user_id=? AND type='withdrawal' AND status='approved'", 
+      [userId]
+    );
+    
     const withdrawalCount = countRow[0].cnt || 0;
     const applicable = rules[String(withdrawalCount + 1)] || rules.default || { amount: 10000, fee_rate: 0.15 };
-    if (amt > Number(applicable.amount)) throw new Error(`Maximum withdrawal for this request is Rs ${applicable.amount}`);
     
+    // Validate amount against limit
+    if (amt > Number(applicable.amount)) {
+      throw new Error(`Maximum withdrawal for this request is Rs ${applicable.amount}. Your limit is based on your VIP level and withdrawal count.`);
+    }
+    
+    // Check referral requirement for 3rd+ withdrawals
+    if (withdrawalCount >= 2) {
+      const [rCount] = await conn.query('SELECT COUNT(*) as cnt FROM referrals WHERE referrer_id=?', [userId]);
+      if (rCount[0].cnt < 3) throw new Error('Complete referral tasks first. You need at least 3 referrals for additional withdrawals.');
+    }
+    
+    // Calculate fee and net amount
     const fee = Math.round(amt * Number(applicable.fee_rate || 0.15) * 100) / 100;
     const net = Math.round((amt - fee) * 100) / 100;
     
-    // Final balance check to ensure no negative balance
+    // Final balance check
     const finalBalance = Number(user.balance) - amt;
     if (finalBalance < 0) throw new Error('Insufficient balance after fee calculation');
     
-    if (withdrawalCount >= 2) {
-      const [rCount] = await conn.query('SELECT COUNT(*) as cnt FROM referrals WHERE referrer_id=?', [userId]);
-      if (rCount[0].cnt < 3) throw new Error('Complete referral tasks first');
-    }
-    
+    // Update balance and create transaction
     await conn.query('UPDATE users SET balance = balance - ? WHERE id=?', [amt, userId]);
-    await conn.query("INSERT INTO transactions (user_id, type, amount, status, details) VALUES (?, 'withdrawal', ?, 'pending', ?)", [userId, amt, `Acct:${account_number}|Name:${account_name}|Fee:${fee}|Net:${net}`]);
+    await conn.query(
+      "INSERT INTO transactions (user_id, type, amount, status, details) VALUES (?, 'withdrawal', ?, 'pending', ?)", 
+      [userId, amt, `Acct:${finalAccountNumber}|Name:${finalAccountName}|Fee:${fee}|Net:${net}|WithdrawalNumber:${withdrawalCount + 1}`]
+    );
+    
     await conn.commit();
+    
     res.json({ 
       message: 'Withdrawal submitted', 
       fee, 
       net_amount: net,
+      account_locked: !!user.withdrawal_account_number, // Tell frontend if account is now locked
       note: "Withdrawal processing typically takes 24-48 hours. Contact us on WhatsApp for urgent queries."
     });
+    
   } catch (e) {
     await conn.rollback();
     logger.error('withdraw failed', { error: e.stack });
     res.status(400).json({ error: e.message || 'Server error' });
+  } finally {
+    conn.release();
+  }
+});
+
+// Get withdrawal limits for current user
+app.get('/api/withdrawal-limits', authenticate, checkDbReady, async (req, res) => {
+  const userId = req.user.id;
+  const conn = await db.getPool().getConnection();
+  
+  try {
+    // Get user's VIP level
+    const [[user]] = await conn.query(
+      'SELECT current_vip_level FROM users WHERE id=?', 
+      [userId]
+    );
+    
+    // Get withdrawal rules for this VIP level
+    const [vrRow] = await conn.query(
+      'SELECT withdrawal_rules FROM vip_levels WHERE level=?', 
+      [user.current_vip_level || 0]
+    );
+    
+    const rules = parseWithdrawalRules(vrRow && vrRow.length ? vrRow[0].withdrawal_rules : '{}');
+    
+    // Count previous approved withdrawals
+    const [countRow] = await conn.query(
+      "SELECT COUNT(*) as cnt FROM transactions WHERE user_id=? AND type='withdrawal' AND status='approved'", 
+      [userId]
+    );
+    
+    const withdrawalCount = countRow[0].cnt || 0;
+    const nextWithdrawalRule = rules[String(withdrawalCount + 1)] || rules.default || { amount: 10000, fee_rate: 0.15 };
+    
+    // Check if user has saved account details
+    const [[accountInfo]] = await conn.query(
+      'SELECT withdrawal_account_number, withdrawal_account_name FROM users WHERE id=?',
+      [userId]
+    );
+    
+    res.json({
+      vip_level: user.current_vip_level || 0,
+      withdrawal_count: withdrawalCount,
+      next_withdrawal_limit: nextWithdrawalRule.amount,
+      fee_rate: nextWithdrawalRule.fee_rate,
+      has_saved_account: !!accountInfo.withdrawal_account_number,
+      account_number: accountInfo.withdrawal_account_number,
+      account_name: accountInfo.withdrawal_account_name
+    });
+    
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
   } finally {
     conn.release();
   }
@@ -806,6 +984,32 @@ app.put('/admin/recharges/:id', checkDbReady, async (req, res) => {
   }
 });
 
+// Admin: override user account lock
+app.put('/admin/users/:id/account-lock', checkDbReady, async (req, res) => {
+  const adminSecret = req.headers['x-admin-secret'];
+  if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) {
+    return res.status(403).json({ error: 'Admin only' });
+  }
+
+  const userId = req.params.id;
+  const { unlock } = req.body; // Set to true to unlock account
+
+  try {
+    if (unlock) {
+      await db.query(
+        'UPDATE users SET withdrawal_account_number = NULL, withdrawal_account_name = NULL WHERE id = ?',
+        [userId]
+      );
+      res.json({ message: 'Account lock removed' });
+    } else {
+      res.json({ message: 'No changes made' });
+    }
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Admin: process withdrawals
 app.put('/admin/withdrawals/:id', checkDbReady, async (req, res) => {
   const adminSecret = req.headers['x-admin-secret'];
   if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
@@ -813,23 +1017,75 @@ app.put('/admin/withdrawals/:id', checkDbReady, async (req, res) => {
   const id = req.params.id;
   const { status } = req.body;
   if (!['approved','rejected'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
+  
   const conn = await db.getPool().getConnection();
   try {
     await conn.beginTransaction();
+    
     if (status === 'rejected') {
-      const [[trx]] = await conn.query('SELECT user_id, amount FROM transactions WHERE id=? AND type="withdrawal"', [id]);
+      const [[trx]] = await conn.query('SELECT user_id, amount FROM transactions WHERE id=? AND type="withdrawal" FOR UPDATE', [id]);
       if (trx) {
+        // Rollback balance
         await conn.query('UPDATE users SET balance = balance + ? WHERE id=?', [trx.amount, trx.user_id]);
+        
+        // Record rollback transaction
+        await conn.query(
+          "INSERT INTO transactions (user_id, type, amount, status, details, reference_id) VALUES (?, 'rollback', ?, 'success', ?, ?)",
+          [trx.user_id, trx.amount, `Rollback for withdrawal #${id}`, id]
+        );
+        
+        // Mark original transaction as failed
+        await conn.query(
+          "UPDATE transactions SET status = 'failed' WHERE id = ? AND type = 'withdrawal'",
+          [id]
+        );
       }
+    } else {
+      // For approval, just update status
+      const [result] = await conn.query(
+        "UPDATE transactions SET status = 'approved' WHERE id = ? AND type = 'withdrawal' AND status = 'pending'",
+        [id]
+      );
+
+      if (result.affectedRows === 0) {
+        await conn.rollback();
+        return res.status(400).json({ error: "Withdrawal not found or already processed" });
+      }
+      
+      // Mark as success in transaction history
+      await conn.query(
+        "UPDATE transactions SET status = 'success' WHERE reference_id = ? AND type = 'withdrawal'",
+        [id]
+      );
     }
-    await conn.query('UPDATE transactions SET status=? WHERE id=?', [status, id]);
+    
     await conn.commit();
-    res.json({ message: 'Updated' });
+    res.json({ message: 'Withdrawal processed successfully' });
   } catch (e) {
     await conn.rollback();
     res.status(500).json({ error: 'Server error' });
   } finally {
     conn.release();
+  }
+});
+
+// Get all pending withdrawals for admin
+app.get("/api/admin/withdrawals/pending", checkDbReady, async (req, res) => {
+  const adminSecret = req.headers['x-admin-secret'];
+  if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
+
+  try {
+    const [rows] = await db.query(
+      `SELECT t.id, t.user_id, u.username, u.current_vip_level as vip_level, t.amount, t.created_at, t.details
+       FROM transactions t
+       JOIN users u ON t.user_id = u.id
+       WHERE t.type = 'withdrawal' AND t.status = 'pending'
+       ORDER BY t.created_at ASC`
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
