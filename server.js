@@ -40,6 +40,25 @@ app.use(helmet());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
+// Add timeout middleware
+app.use((req, res, next) => {
+  // Set timeout for all HTTP requests
+  req.setTimeout(15000, () => {
+    logger.warn(`Request timeout for ${req.method} ${req.url}`);
+    res.status(504).json({ error: 'Request timeout' });
+  });
+  
+  // Set timeout for HTTP server response
+  res.setTimeout(15000, () => {
+    logger.warn(`Response timeout for ${req.method} ${req.url}`);
+    if (!res.headersSent) {
+      res.status(504).json({ error: 'Response timeout' });
+    }
+  });
+  
+  next();
+});
+
 // Rate limiter
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
@@ -294,28 +313,66 @@ app.get('/api/balance', authenticate, checkDbReady, async (req, res) => {
 
 // All transactions
 app.get('/api/transactions', authenticate, checkDbReady, async (req, res) => {
-  const { type } = req.query;
-  const params = [req.user.id];
-  let sql = 'SELECT id, type, amount, status, details, account_number, account_name, receipt_url, notes, created_at FROM transactions WHERE user_id=?';
-  if (type) {
-    sql += ' AND type = ?';
-    params.push(type);
+  try {
+    const { type } = req.query;
+    const params = [req.user.id];
+    let sql = 'SELECT id, type, amount, status, details, account_number, account_name, receipt_url, notes, created_at FROM transactions WHERE user_id=?';
+    
+    if (type) {
+      sql += ' AND type = ?';
+      params.push(type);
+    }
+    sql += ' ORDER BY created_at DESC';
+    
+    logger.info(`Fetching transactions for user ${req.user.id}, type: ${type || 'all'}`);
+    const [rows] = await db.query(sql, params);
+    logger.info(`Found ${rows.length} transaction records for user ${req.user.id}`);
+    res.json(rows);
+  } catch (e) {
+    logger.error('Error fetching transactions:', { error: e.stack, userId: req.user.id, type: req.query.type });
+    res.status(500).json({ error: 'Server error while fetching transactions' });
   }
-  sql += ' ORDER BY created_at DESC';
-  const [rows] = await db.query(sql, params);
-  res.json(rows);
 });
 
 // Recharge history
 app.get('/api/recharge-history', authenticate, checkDbReady, async (req, res) => {
-  const [rows] = await db.query(
-    `SELECT id, amount, status, receipt_url, account_number, account_name, created_at 
-     FROM transactions 
-     WHERE user_id=? AND type='recharge' 
-     ORDER BY created_at DESC`,
-    [req.user.id]
-  );
-  res.json(rows);
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = (page - 1) * limit;
+    
+    logger.info(`Fetching recharge history for user ${req.user.id}, page ${page}`);
+    
+    const [rows] = await db.query(
+      `SELECT id, amount, status, receipt_url, account_number, account_name, created_at 
+       FROM transactions 
+       WHERE user_id=? AND type='recharge' 
+       ORDER BY created_at DESC
+       LIMIT ? OFFSET ?`,
+      [req.user.id, limit, offset]
+    );
+    
+    // Get total count for pagination info
+    const [[countResult]] = await db.query(
+      `SELECT COUNT(*) as total FROM transactions WHERE user_id=? AND type='recharge'`,
+      [req.user.id]
+    );
+    
+    logger.info(`Found ${rows.length} recharge records for user ${req.user.id}`);
+    
+    res.json({
+      data: rows,
+      pagination: {
+        current: page,
+        limit: limit,
+        total: countResult.total,
+        pages: Math.ceil(countResult.total / limit)
+      }
+    });
+  } catch (e) {
+    logger.error('Error fetching recharge history:', { error: e.stack, userId: req.user.id });
+    res.status(500).json({ error: 'Server error while fetching recharge history' });
+  }
 });
 
 // Withdrawal history
@@ -938,7 +995,7 @@ app.get('/admin/recharges', checkDbReady, async (req, res) => {
   }
 });
 
-// Admin: view receipt
+// Admin: view receipt - FIXED to force download
 app.get('/admin/receipt/:transactionId', checkDbReady, async (req, res) => {
   const adminSecret = req.headers['x-admin-secret'];
   if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
@@ -955,11 +1012,14 @@ app.get('/admin/receipt/:transactionId', checkDbReady, async (req, res) => {
       return res.status(404).json({ error: 'Receipt not found' });
     }
     
+    // Set headers to force download
     res.setHeader('Content-Type', transaction.receipt_type);
-    res.setHeader('Content-Disposition', `inline; filename="${transaction.receipt_filename}"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${transaction.receipt_filename}"`);
     
+    // Send the binary data
     res.send(transaction.receipt_data);
   } catch (e) {
+    logger.error('Error fetching receipt:', { error: e.stack, transactionId });
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1127,6 +1187,44 @@ app.get("/api/admin/withdrawals/pending", checkDbReady, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Debug endpoint to check user's recharge transactions
+app.get('/api/debug/recharge', authenticate, checkDbReady, async (req, res) => {
+  try {
+    // Check if user exists
+    const [[user]] = await db.query('SELECT id, username FROM users WHERE id = ?', [req.user.id]);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Check transaction count
+    const [[count]] = await db.query(
+      'SELECT COUNT(*) as count FROM transactions WHERE user_id = ? AND type = "recharge"',
+      [req.user.id]
+    );
+    
+    // Check if there are any very large records
+    const [largeRecords] = await db.query(
+      `SELECT id, LENGTH(details) as details_length, 
+              LENGTH(account_number) as account_number_length,
+              LENGTH(account_name) as account_name_length
+       FROM transactions 
+       WHERE user_id = ? AND type = "recharge"
+       ORDER BY created_at DESC 
+       LIMIT 5`,
+      [req.user.id]
+    );
+    
+    res.json({
+      user: { id: user.id, username: user.username },
+      recharge_count: count.count,
+      largest_records: largeRecords
+    });
+  } catch (e) {
+    logger.error('Debug error:', { error: e.stack, userId: req.user.id });
+    res.status(500).json({ error: 'Debug error: ' + e.message });
   }
 });
 
