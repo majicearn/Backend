@@ -9,6 +9,8 @@ CREATE TABLE IF NOT EXISTS users (
   referral_code VARCHAR(40) UNIQUE,
   balance DECIMAL(14,2) DEFAULT 0.00,
   current_vip_level INT DEFAULT 0,
+  withdrawal_account_number VARCHAR(255) DEFAULT NULL,
+  withdrawal_account_name VARCHAR(255) DEFAULT NULL,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -27,7 +29,7 @@ CREATE TABLE IF NOT EXISTS user_vip_purchases (
   vip_level_id INT NOT NULL,
   purchase_date DATETIME NOT NULL,
   expiry_date DATETIME NOT NULL,
-  status ENUM('active','expired','cancelled') DEFAULT 'active',
+  active TINYINT(1) DEFAULT 1,
   FOREIGN KEY (user_id) REFERENCES users(id),
   FOREIGN KEY (vip_level_id) REFERENCES vip_levels(id),
   INDEX idx_user_vip (user_id),
@@ -41,9 +43,18 @@ CREATE TABLE IF NOT EXISTS transactions (
   amount DECIMAL(14,2) NOT NULL,
   status ENUM('pending','approved','rejected') DEFAULT 'pending',
   details TEXT,
+  account_number VARCHAR(255),
+  account_name VARCHAR(255),
+  receipt_data LONGBLOB,
+  receipt_filename VARCHAR(255),
+  receipt_type VARCHAR(100),
+  notes TEXT,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (user_id) REFERENCES users(id),
-  INDEX idx_user_type (user_id, type)
+  INDEX idx_user_id (user_id),
+  INDEX idx_type (type),
+  INDEX idx_user_type (user_id, type),
+  INDEX idx_created_at (created_at DESC)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS referrals (
