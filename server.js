@@ -307,16 +307,21 @@ app.get('/api/user/profile', authenticate, checkDbReady, async (req, res) => {
 
 // Current balance
 app.get('/api/balance', authenticate, checkDbReady, async (req, res) => {
-  const [[row]] = await db.query('SELECT balance FROM users WHERE id=?', [req.user.id]);
-  res.json({ balance: Number(row?.balance || 0) });
+  try {
+    const [[row]] = await db.query('SELECT balance FROM users WHERE id=?', [req.user.id]);
+    res.json({ balance: Number(row?.balance || 0) });
+  } catch (e) {
+    logger.error('Error fetching balance:', { error: e.stack, userId: req.user.id });
+    res.status(500).json({ error: 'Server error while fetching balance' });
+  }
 });
 
-// All transactions
+// All transactions - FIXED: Removed receipt_url column
 app.get('/api/transactions', authenticate, checkDbReady, async (req, res) => {
   try {
     const { type } = req.query;
     const params = [req.user.id];
-    let sql = 'SELECT id, type, amount, status, details, account_number, account_name, receipt_url, notes, created_at FROM transactions WHERE user_id=?';
+    let sql = 'SELECT id, type, amount, status, details, account_number, account_name, notes, created_at FROM transactions WHERE user_id=?';
     
     if (type) {
       sql += ' AND type = ?';
@@ -334,7 +339,7 @@ app.get('/api/transactions', authenticate, checkDbReady, async (req, res) => {
   }
 });
 
-// Recharge history
+// Recharge history - FIXED: Removed receipt_url column
 app.get('/api/recharge-history', authenticate, checkDbReady, async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
@@ -344,7 +349,7 @@ app.get('/api/recharge-history', authenticate, checkDbReady, async (req, res) =>
     logger.info(`Fetching recharge history for user ${req.user.id}, page ${page}`);
     
     const [rows] = await db.query(
-      `SELECT id, amount, status, receipt_url, account_number, account_name, created_at 
+      `SELECT id, amount, status, account_number, account_name, created_at 
        FROM transactions 
        WHERE user_id=? AND type='recharge' 
        ORDER BY created_at DESC
@@ -377,14 +382,19 @@ app.get('/api/recharge-history', authenticate, checkDbReady, async (req, res) =>
 
 // Withdrawal history
 app.get('/api/withdrawal-history', authenticate, checkDbReady, async (req, res) => {
-  const [rows] = await db.query(
-    `SELECT id, amount, status, details, created_at 
-     FROM transactions 
-     WHERE user_id=? AND type='withdrawal' 
-     ORDER BY created_at DESC`,
-    [req.user.id]
-  );
-  res.json(rows);
+  try {
+    const [rows] = await db.query(
+      `SELECT id, amount, status, details, created_at 
+       FROM transactions 
+       WHERE user_id=? AND type='withdrawal' 
+       ORDER BY created_at DESC`,
+      [req.user.id]
+    );
+    res.json(rows);
+  } catch (e) {
+    logger.error('Error fetching withdrawal history:', { error: e.stack, userId: req.user.id });
+    res.status(500).json({ error: 'Server error while fetching withdrawal history' });
+  }
 });
 
 // Change password
@@ -558,7 +568,7 @@ app.get('/admin/users/:id/details', checkDbReady, async (req, res) => {
 
     // Get user transactions
     const [transactions] = await db.query(
-      'SELECT id, type, amount, status, details, account_number, account_name, receipt_url, notes, created_at FROM transactions WHERE user_id = ? ORDER by created_at DESC',
+      'SELECT id, type, amount, status, details, account_number, account_name, notes, created_at FROM transactions WHERE user_id = ? ORDER by created_at DESC',
       [userId]
     );
 
@@ -676,7 +686,7 @@ app.post('/api/vip/purchase', authenticate, checkDbReady, async (req, res) => {
     await conn.query('INSERT INTO user_vip_purchases (user_id, vip_level_id, purchase_date, expiry_date, active) VALUES (?,?,?,?,1)', 
       [userId, vip_level_id, purchaseDate.toISOString().slice(0,10), expiry.toISOString().slice(0,10)]);
     
-    const [maxRow] = await conn.query(`SELECT MAX(v.level) as maxLevel FROM user_vip_purchases p JOIN vip_levels v ON p.vip_level_id = v.id WHERE p.user_id=? AND p.active=1`, [userId]);
+    const [maxRow] = await conn.query(`SELECT MAX(v.level) as maxLevel FROM user_vip Purchases p JOIN vip_levels v ON p.vip_level_id = v.id WHERE p.user_id=? AND p.active=1`, [userId]);
     const maxLevel = maxRow[0].maxLevel || 0;
     
     if (maxLevel > (user.current_vip_level || 0)) {
@@ -959,7 +969,7 @@ app.get('/api/team', authenticate, checkDbReady, async (req, res) => {
 // Admin: list withdrawals
 app.get('/admin/withdrawals', checkDbReady, async (req, res) => {
   const adminSecret = req.headers['x-admin-secret'];
-  if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'Admin only' });
+  if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) return res.status(503).json({ error: 'Admin only' });
   const conn = await db.getPool().getConnection();
   try {
     const [rows] = await conn.query(`SELECT t.*, u.username, u.email, u.phone FROM transactions t JOIN users u ON t.user_id = u.id WHERE t.type='withdrawal' ORDER by t.created_at DESC`);
