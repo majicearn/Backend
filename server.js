@@ -227,27 +227,37 @@ app.get('/api/testdb', checkDbReady, async (req, res) => {
   }
 });
 
-// Register
+// Register - UPDATED to always generate referral code and return it
 app.post('/api/register', checkDbReady, async (req, res) => {
-  const { username, email, phone, password, referral_code } = req.body;
+  const { username, email, phone, password, referrer_code } = req.body; // <-- rename on client too
   if (!username || !email || !phone || !password) return res.status(400).json({ error: 'Missing fields' });
+
   const hashed = await bcrypt.hash(password, 10);
-  const refCode = referral_code || Math.random().toString(36).slice(2, 10).toUpperCase();
+  const newUserCode = Math.random().toString(36).slice(2, 10).toUpperCase(); // <-- always generate
 
   const conn = await db.getPool().getConnection();
   try {
     await conn.beginTransaction();
-    const [ins] = await conn.query('INSERT INTO users (username,email,phone,password,referral_code) VALUES (?,?,?,?,?)', [username, email, phone, hashed, refCode]);
+
+    const [ins] = await conn.query(
+      'INSERT INTO users (username,email,phone,password,referral_code) VALUES (?,?,?,?,?)',
+      [username, email, phone, hashed, newUserCode]
+    );
     const userId = ins.insertId;
-    if (referral_code) {
-      const [rows] = await conn.query('SELECT id FROM users WHERE referral_code=?', [referral_code]);
+
+    if (referrer_code) {
+      const [rows] = await conn.query('SELECT id FROM users WHERE referral_code=?', [referrer_code]);
       if (rows.length) {
-        await conn.query('INSERT INTO referrals (referrer_id, referred_id, referral_date) VALUES (?,?,CURDATE())', [rows[0].id, userId]);
+        await conn.query(
+          'INSERT INTO referrals (referrer_id, referred_id, referral_date) VALUES (?,?,CURDATE())',
+          [rows[0].id, userId]
+        );
       }
     }
+
     await conn.commit();
     const token = signJwt({ id: userId, username });
-    res.status(201).json({ token });
+    res.status(201).json({ token, referral_code: newUserCode }); // return their own code
   } catch (e) {
     await conn.rollback();
     if (e.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Duplicate entry' });
