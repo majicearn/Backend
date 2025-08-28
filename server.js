@@ -229,11 +229,11 @@ app.get('/api/testdb', checkDbReady, async (req, res) => {
 
 // Register - UPDATED to always generate referral code and return it
 app.post('/api/register', checkDbReady, async (req, res) => {
-  const { username, email, phone, password, referrer_code } = req.body; // <-- rename on client too
+  const { username, email, phone, password, referrer_code } = req.body;
   if (!username || !email || !phone || !password) return res.status(400).json({ error: 'Missing fields' });
 
   const hashed = await bcrypt.hash(password, 10);
-  const newUserCode = Math.random().toString(36).slice(2, 10).toUpperCase(); // <-- always generate
+  const newUserCode = Math.random().toString(36).slice(2, 10).toUpperCase();
 
   const conn = await db.getPool().getConnection();
   try {
@@ -257,7 +257,7 @@ app.post('/api/register', checkDbReady, async (req, res) => {
 
     await conn.commit();
     const token = signJwt({ id: userId, username });
-    res.status(201).json({ token, referral_code: newUserCode }); // return their own code
+    res.status(201).json({ token, referral_code: newUserCode });
   } catch (e) {
     await conn.rollback();
     if (e.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Duplicate entry' });
@@ -464,6 +464,144 @@ app.get('/api/tasks-status', authenticate, checkDbReady, async (req, res) => {
     withdrawal_locked: needsReferrals && !hasEnoughReferrals,
     requirement: needsReferrals ? '3 referrals required (1 ≥ your level, 2 any level)' : 'None'
   });
+});
+
+// Get user tasks and claim status
+app.get('/api/tasks', authenticate, checkDbReady, async (req, res) => {
+  const userId = req.user.id;
+  
+  try {
+      // Check if user can claim daily earnings
+      const [[lastClaim]] = await db.query(
+          `SELECT created_at FROM transactions 
+           WHERE user_id = ? AND type = 'daily_earning' 
+           ORDER BY created_at DESC LIMIT 1`,
+          [userId]
+      );
+      
+      const canClaim = !lastClaim || 
+          new Date() - new Date(lastClaim.created_at) > 24 * 60 * 60 * 1000;
+      
+      const nextClaimTime = lastClaim ? 
+          new Date(new Date(lastClaim.created_at).getTime() + 24 * 60 * 60 * 1000) : 
+          new Date();
+      
+      // Get user's VIP level and daily earnings
+      const [[user]] = await db.query(
+          `SELECT u.current_vip_level, v.daily_earnings 
+           FROM users u 
+           LEFT JOIN vip_levels v ON u.current_vip_level = v.level 
+           WHERE u.id = ?`,
+          [userId]
+      );
+      
+      const dailyEarnings = user ? user.daily_earnings || 0 : 0;
+      
+      // Check referral requirements for withdrawals
+      const [[withdrawalCount]] = await db.query(
+          "SELECT COUNT(*) AS cnt FROM transactions WHERE user_id = ? AND type = 'withdrawal' AND status = 'approved'",
+          [userId]
+      );
+      
+      const [[referralCount]] = await db.query(
+          "SELECT COUNT(*) AS cnt FROM referrals WHERE referrer_id = ?",
+          [userId]
+      );
+      
+      const needsReferrals = Number(withdrawalCount.cnt) >= 2;
+      const requiredReferrals = 3;
+      
+      res.json({
+          can_claim: canClaim && dailyEarnings > 0,
+          next_claim_time: nextClaimTime.toISOString(),
+          daily_earnings: dailyEarnings,
+          referral_requirements: {
+              needs_referrals: needsReferrals,
+              current_count: Number(referralCount.cnt),
+              required_count: requiredReferrals
+          }
+      });
+      
+  } catch (error) {
+      logger.error('Error fetching tasks:', error);
+      res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Claim daily earnings
+app.post('/api/tasks/claim-daily', authenticate, checkDbReady, async (req, res) => {
+  const userId = req.user.id;
+  const conn = await db.getPool().getConnection();
+  
+  try {
+      await conn.beginTransaction();
+      
+      // Check if user can claim (prevent double claiming)
+      const [[lastClaim]] = await conn.query(
+          `SELECT created_at FROM transactions 
+           WHERE user_id = ? AND type = 'daily_earning' 
+           ORDER BY created_at DESC LIMIT 1`,
+          [userId]
+      );
+      
+      if (lastClaim && (new Date() - new Date(lastClaim.created_at) <= 24 * 60 * 60 * 1000)) {
+          await conn.rollback();
+          return res.status(400).json({ 
+              success: false, 
+              message: 'You can only claim once every 24 hours' 
+          });
+      }
+      
+      // Get user's daily earnings amount
+      const [[user]] = await conn.query(
+          `SELECT u.current_vip_level, v.daily_earnings 
+           FROM users u 
+           LEFT JOIN vip_levels v ON u.current_vip_level = v.level 
+           WHERE u.id = ? FOR UPDATE`,
+          [userId]
+      );
+      
+      const dailyEarnings = user ? user.daily_earnings || 0 : 0;
+      
+      if (dailyEarnings <= 0) {
+          await conn.rollback();
+          return res.status(400).json({ 
+              success: false, 
+              message: 'No active VIP found for daily earnings' 
+          });
+      }
+      
+      // Update user balance
+      await conn.query(
+          'UPDATE users SET balance = balance + ? WHERE id = ?',
+          [dailyEarnings, userId]
+      );
+      
+      // Record transaction
+      await conn.query(
+          `INSERT INTO transactions (user_id, type, amount, status, details) 
+           VALUES (?, 'daily_earning', ?, 'approved', 'Daily VIP earnings')`,
+          [userId, dailyEarnings]
+      );
+      
+      await conn.commit();
+      
+      res.json({ 
+          success: true, 
+          amount: dailyEarnings,
+          message: 'Daily earnings claimed successfully' 
+      });
+      
+  } catch (error) {
+      await conn.rollback();
+      logger.error('Error claiming daily earnings:', error);
+      res.status(500).json({ 
+          success: false, 
+          message: 'Server error' 
+      });
+  } finally {
+      conn.release();
+  }
 });
 
 // Announcements
@@ -696,7 +834,7 @@ app.post('/api/vip/purchase', authenticate, checkDbReady, async (req, res) => {
     await conn.query('INSERT INTO user_vip_purchases (user_id, vip_level_id, purchase_date, expiry_date, active) VALUES (?,?,?,?,1)', 
       [userId, vip_level_id, purchaseDate.toISOString().slice(0,10), expiry.toISOString().slice(0,10)]);
     
-    const [maxRow] = await conn.query(`SELECT MAX(v.level) as maxLevel FROM user_vip Purchases p JOIN vip_levels v ON p.vip_level_id = v.id WHERE p.user_id=? AND p.active=1`, [userId]);
+    const [maxRow] = await conn.query(`SELECT MAX(v.level) as maxLevel FROM user_vip_purchases p JOIN vip_levels v ON p.vip_level_id = v.id WHERE p.user_id=? AND p.active=1`, [userId]);
     const maxLevel = maxRow[0].maxLevel || 0;
     
     if (maxLevel > (user.current_vip_level || 0)) {
