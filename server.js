@@ -183,6 +183,23 @@ const checkDbReady = (req, res, next) => {
   next();
 };
 
+// Admin authentication middleware
+function checkAdminAuth(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth) return res.status(401).json({ error: 'Missing token' });
+  const token = auth.split(' ')[1];
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    if (decoded.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+    req.admin = decoded;
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
 // ============================
 // ROUTES
 // ============================
@@ -1384,6 +1401,357 @@ app.get('/api/debug/recharge', authenticate, checkDbReady, async (req, res) => {
     logger.error('Debug error:', { error: e.stack, userId: req.user.id });
     res.status(500).json({ error: 'Debug error: ' + e.message });
   }
+});
+
+// ============================
+// NEW ADMIN ENDPOINTS
+// ============================
+
+// Admin authentication
+app.post('/api/admin/login', async (req, res) => {
+    const { username, password } = req.body;
+    
+    // Check if admin credentials are correct
+    if (username === process.env.ADMIN_USERNAME && password === process.env.ADMIN_PASSWORD) {
+        const token = jwt.sign({ role: 'admin' }, process.env.JWT_SECRET);
+        res.json({ token });
+    } else {
+        res.status(401).json({ error: 'Invalid admin credentials' });
+    }
+});
+
+// Admin stats
+app.get('/api/admin/stats', checkAdminAuth, async (req, res) => {
+    try {
+        // Get total users
+        const [[userCount]] = await db.query('SELECT COUNT(*) as total FROM users');
+        
+        // Get total revenue
+        const [[revenue]] = await db.query(`
+            SELECT SUM(amount) as total FROM transactions 
+            WHERE type IN ('recharge', 'vip_purchase') AND status = 'approved'
+        `);
+        
+        // Get total transactions
+        const [[transactionCount]] = await db.query('SELECT COUNT(*) as total FROM transactions');
+        
+        // Get pending actions
+        const [[pendingCount]] = await db.query(`
+            SELECT COUNT(*) as total FROM transactions 
+            WHERE status = 'pending'
+        `);
+        
+        res.json({
+            totalUsers: userCount.total,
+            totalRevenue: revenue.total || 0,
+            totalTransactions: transactionCount.total,
+            pendingActions: pendingCount.total
+        });
+    } catch (error) {
+        logger.error('Failed to fetch admin stats:', error);
+        res.status(500).json({ error: 'Failed to fetch stats' });
+    }
+});
+
+// Recent activity
+app.get('/api/admin/recent-activity', checkAdminAuth, async (req, res) => {
+    try {
+        // Get recent user registrations
+        const [userRegistrations] = await db.query(`
+            SELECT username, created_at as timestamp 
+            FROM users 
+            ORDER BY created_at DESC 
+            LIMIT 5
+        `);
+        
+        // Get recent transactions
+        const [transactions] = await db.query(`
+            SELECT t.*, u.username 
+            FROM transactions t 
+            JOIN users u ON t.user_id = u.id 
+            ORDER BY t.created_at DESC 
+            LIMIT 5
+        `);
+        
+        // Format activities
+        const activities = [];
+        
+        userRegistrations.forEach(user => {
+            activities.push({
+                type: 'user_registered',
+                message: `New user registered: ${user.username}`,
+                timestamp: user.timestamp
+            });
+        });
+        
+        transactions.forEach(transaction => {
+            let message = '';
+            if (transaction.type === 'recharge') {
+                message = `Recharge from ${transaction.username}: Rs. ${transaction.amount}`;
+            } else if (transaction.type === 'withdrawal') {
+                message = `Withdrawal request from ${transaction.username}: Rs. ${transaction.amount}`;
+            } else if (transaction.type === 'vip_purchase') {
+                message = `VIP purchase by ${transaction.username}: Rs. ${transaction.amount}`;
+            }
+            
+            activities.push({
+                type: transaction.type,
+                message: message,
+                timestamp: transaction.created_at
+            });
+        });
+        
+        // Sort by timestamp
+        activities.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+        
+        res.json(activities.slice(0, 5));
+    } catch (error) {
+        logger.error('Failed to fetch recent activity:', error);
+        res.status(500).json({ error: 'Failed to fetch activity' });
+    }
+});
+
+// Revenue data
+app.get('/api/admin/revenue-data', checkAdminAuth, async (req, res) => {
+    try {
+        const days = parseInt(req.query.days) || 7;
+        const data = [];
+        const labels = [];
+        
+        // Generate data for the last X days
+        for (let i = days - 1; i >= 0; i--) {
+            const date = new Date();
+            date.setDate(date.getDate() - i);
+            const dateString = date.toISOString().split('T')[0];
+            
+            // Get revenue for this date
+            const [[revenue]] = await db.query(`
+                SELECT SUM(amount) as total FROM transactions 
+                WHERE DATE(created_at) = ? 
+                AND type IN ('recharge', 'vip_purchase') 
+                AND status = 'approved'
+            `, [dateString]);
+            
+            data.push(revenue.total || 0);
+            labels.push(dateString);
+        }
+        
+        res.json({ data, labels });
+    } catch (error) {
+        logger.error('Failed to fetch revenue data:', error);
+        res.status(500).json({ error: 'Failed to fetch revenue data' });
+    }
+});
+
+// User management endpoints
+app.get('/api/admin/users', checkAdminAuth, async (req, res) => {
+    try {
+        const [users] = await db.query(`
+            SELECT id, username, email, phone, balance, current_vip_level, status, created_at 
+            FROM users 
+            ORDER BY id DESC
+        `);
+        res.json(users);
+    } catch (error) {
+        logger.error('Failed to fetch users:', error);
+        res.status(500).json({ error: 'Failed to fetch users' });
+    }
+});
+
+app.get('/api/admin/users/:id', checkAdminAuth, async (req, res) => {
+    try {
+        const userId = req.params.id;
+        const [[user]] = await db.query(`
+            SELECT id, username, email, phone, balance, current_vip_level, status, created_at 
+            FROM users 
+            WHERE id = ?
+        `, [userId]);
+        
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        
+        res.json(user);
+    } catch (error) {
+        logger.error('Failed to fetch user:', error);
+        res.status(500).json({ error: 'Failed to fetch user' });
+    }
+});
+
+app.get('/api/admin/users/:id/details', checkAdminAuth, async (req, res) => {
+    try {
+        const userId = req.params.id;
+        
+        // Get user details
+        const [[user]] = await db.query(`
+            SELECT id, username, email, phone, balance, current_vip_level, status, created_at 
+            FROM users 
+            WHERE id = ?
+        `, [userId]);
+        
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        
+        // Get user transactions
+        const [transactions] = await db.query(`
+            SELECT id, type, amount, status, created_at 
+            FROM transactions 
+            WHERE user_id = ? 
+            ORDER BY created_at DESC 
+            LIMIT 10
+        `, [userId]);
+        
+        // Get user referrals
+        const [referrals] = await db.query(`
+            SELECT u.username, u.phone, r.referral_date 
+            FROM referrals r 
+            JOIN users u ON r.referred_id = u.id 
+            WHERE r.referrer_id = ?
+        `, [userId]);
+        
+        // Get user VIP purchases
+        const [vipPurchases] = await db.query(`
+            SELECT p.*, v.level, v.price 
+            FROM user_vip_purchases p 
+            JOIN vip_levels v ON p.vip_level_id = v.id 
+            WHERE p.user_id = ? 
+            ORDER BY p.purchase_date DESC
+        `, [userId]);
+        
+        res.json({
+            user,
+            transactions,
+            referrals,
+            vipPurchases
+        });
+    } catch (error) {
+        logger.error('Failed to fetch user details:', error);
+        res.status(500).json({ error: 'Failed to fetch user details' });
+    }
+});
+
+app.post('/api/admin/users', checkAdminAuth, async (req, res) => {
+    const { username, email, phone, password, balance, vip_level } = req.body;
+    
+    if (!username || !email || !password) {
+        return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    const conn = await db.getPool().getConnection();
+    
+    try {
+        await conn.beginTransaction();
+        
+        // Hash password
+        const hashedPassword = await bcrypt.hash(password, 10);
+        
+        // Generate referral code
+        const referralCode = Math.random().toString(36).slice(2, 10).toUpperCase();
+        
+        // Create user
+        const [result] = await conn.query(`
+            INSERT INTO users (username, email, phone, password, balance, current_vip_level, referral_code, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
+        `, [username, email, phone, hashedPassword, balance || 0, vip_level || 0, referralCode]);
+        
+        // Update balance if provided
+        if (balance && balance > 0) {
+            await conn.query(`
+                INSERT INTO transactions (user_id, type, amount, status, details)
+                VALUES (?, 'admin_adjustment', ?, 'approved', 'Initial balance adjustment by admin')
+            `, [result.insertId, balance]);
+        }
+        
+        await conn.commit();
+        
+        res.json({ message: 'User created successfully', userId: result.insertId });
+    } catch (error) {
+        await conn.rollback();
+        
+        if (error.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ error: 'User already exists' });
+        }
+        
+        logger.error('Failed to create user:', error);
+        res.status(500).json({ error: 'Failed to create user' });
+    } finally {
+        conn.release();
+    }
+});
+
+app.put('/api/admin/users/:id', checkAdminAuth, async (req, res) => {
+    const userId = req.params.id;
+    const { username, email, phone, balance, vip_level, status } = req.body;
+    
+    const conn = await db.getPool().getConnection();
+    
+    try {
+        await conn.beginTransaction();
+        
+        // Get current user data
+        const [[user]] = await conn.query('SELECT balance FROM users WHERE id = ?', [userId]);
+        
+        if (!user) {
+            await conn.rollback();
+            return res.status(404).json({ error: 'User not found' });
+        }
+        
+        // Update user
+        await conn.query(`
+            UPDATE users 
+            SET username = ?, email = ?, phone = ?, current_vip_level = ?, status = ?
+            WHERE id = ?
+        `, [username, email, phone, vip_level, status, userId]);
+        
+        // Adjust balance if changed
+        const balanceDiff = balance - user.balance;
+        if (balanceDiff !== 0) {
+            await conn.query('UPDATE users SET balance = ? WHERE id = ?', [balance, userId]);
+            
+            await conn.query(`
+                INSERT INTO transactions (user_id, type, amount, status, details)
+                VALUES (?, 'admin_adjustment', ?, 'approved', ?)
+            `, [userId, Math.abs(balanceDiff), balanceDiff > 0 ? 
+                'Balance increased by admin' : 'Balance decreased by admin']);
+        }
+        
+        await conn.commit();
+        
+        res.json({ message: 'User updated successfully' });
+    } catch (error) {
+        await conn.rollback();
+        
+        if (error.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ error: 'User already exists' });
+        }
+        
+        logger.error('Failed to update user:', error);
+        res.status(500).json({ error: 'Failed to update user' });
+    } finally {
+        conn.release();
+    }
+});
+
+app.delete('/api/admin/users/:id', checkAdminAuth, async (req, res) => {
+    const userId = req.params.id;
+    
+    try {
+        // Check if user exists
+        const [[user]] = await db.query('SELECT id FROM users WHERE id = ?', [userId]);
+        
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        
+        // Delete user (you might want to soft delete instead)
+        await db.query('DELETE FROM users WHERE id = ?', [userId]);
+        
+        res.json({ message: 'User deleted successfully' });
+    } catch (error) {
+        logger.error('Failed to delete user:', error);
+        res.status(500).json({ error: 'Failed to delete user' });
+    }
 });
 
 // ============================
