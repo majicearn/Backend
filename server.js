@@ -175,6 +175,28 @@ function parseWithdrawalRules(json) {
   }
 }
 
+// CSV conversion helper
+function convertToCSV(objArray) {
+  const array = typeof objArray !== 'object' ? JSON.parse(objArray) : objArray;
+  let str = '';
+
+  // Headers
+  const headers = Object.keys(array[0]);
+  str += headers.join(',') + '\r\n';
+
+  // Rows
+  for (let i = 0; i < array.length; i++) {
+    let line = '';
+    for (let index in headers) {
+      if (line !== '') line += ',';
+      line += array[i][headers[index]];
+    }
+    str += line + '\r\n';
+  }
+
+  return str;
+}
+
 // Database readiness middleware
 const checkDbReady = (req, res, next) => {
   if (!dbInitialized) {
@@ -1751,6 +1773,700 @@ app.delete('/api/admin/users/:id', checkAdminAuth, async (req, res) => {
     } catch (error) {
         logger.error('Failed to delete user:', error);
         res.status(500).json({ error: 'Failed to delete user' });
+    }
+});
+
+// ============================
+// VIP MANAGEMENT ENDPOINTS
+// ============================
+
+// VIP Management Endpoints
+app.get('/api/admin/vip-levels', checkAdminAuth, async (req, res) => {
+    try {
+        const [vipLevels] = await db.query('SELECT * FROM vip_levels ORDER BY level');
+        res.json({ data: vipLevels });
+    } catch (error) {
+        logger.error('Failed to fetch VIP levels:', error);
+        res.status(500).json({ error: 'Failed to fetch VIP levels' });
+    }
+});
+
+app.get('/api/admin/vip-levels/:id', checkAdminAuth, async (req, res) => {
+    try {
+        const vipId = req.params.id;
+        const [[vipLevel]] = await db.query('SELECT * FROM vip_levels WHERE id = ?', [vipId]);
+        
+        if (!vipLevel) {
+            return res.status(404).json({ error: 'VIP level not found' });
+        }
+        
+        res.json({ data: vipLevel });
+    } catch (error) {
+        logger.error('Failed to fetch VIP level:', error);
+        res.status(500).json({ error: 'Failed to fetch VIP level' });
+    }
+});
+
+app.post('/api/admin/vip-levels', checkAdminAuth, async (req, res) => {
+    const { level, name, price, daily_earnings, duration, status, description } = req.body;
+    
+    if (!level || !name || !price || !daily_earnings || !duration || !status) {
+        return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    try {
+        const [result] = await db.query(`
+            INSERT INTO vip_levels (level, name, price, daily_earnings, duration, status, description)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        `, [level, name, price, daily_earnings, duration, status, description]);
+        
+        res.json({ message: 'VIP level created successfully', id: result.insertId });
+    } catch (error) {
+        if (error.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ error: 'VIP level already exists' });
+        }
+        
+        logger.error('Failed to create VIP level:', error);
+        res.status(500).json({ error: 'Failed to create VIP level' });
+    }
+});
+
+app.put('/api/admin/vip-levels/:id', checkAdminAuth, async (req, res) => {
+    const vipId = req.params.id;
+    const { level, name, price, daily_earnings, duration, status, description } = req.body;
+    
+    try {
+        // Check if VIP level exists
+        const [[vipLevel]] = await db.query('SELECT id FROM vip_levels WHERE id = ?', [vipId]);
+        
+        if (!vipLevel) {
+            return res.status(404).json({ error: 'VIP level not found' });
+        }
+        
+        // Update VIP level
+        await db.query(`
+            UPDATE vip_levels 
+            SET level = ?, name = ?, price = ?, daily_earnings = ?, duration = ?, status = ?, description = ?
+            WHERE id = ?
+        `, [level, name, price, daily_earnings, duration, status, description, vipId]);
+        
+        res.json({ message: 'VIP level updated successfully' });
+    } catch (error) {
+        if (error.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ error: 'VIP level already exists' });
+        }
+        
+        logger.error('Failed to update VIP level:', error);
+        res.status(500).json({ error: 'Failed to update VIP level' });
+    }
+});
+
+app.delete('/api/admin/vip-levels/:id', checkAdminAuth, async (req, res) => {
+    const vipId = req.params.id;
+    
+    try {
+        // Check if VIP level exists
+        const [[vipLevel]] = await db.query('SELECT id FROM vip_levels WHERE id = ?', [vipId]);
+        
+        if (!vipLevel) {
+            return res.status(404).json({ error: 'VIP level not found' });
+        }
+        
+        // Delete VIP level
+        await db.query('DELETE FROM vip_levels WHERE id = ?', [vipId]);
+        
+        res.json({ message: 'VIP level deleted successfully' });
+    } catch (error) {
+        logger.error('Failed to delete VIP level:', error);
+        res.status(500).json({ error: 'Failed to delete VIP level' });
+    }
+});
+
+// ============================
+// TRANSACTIONS ENDPOINTS
+// ============================
+
+// Get all transactions with filters
+app.get('/api/admin/transactions', checkAdminAuth, async (req, res) => {
+    try {
+        const { type, status, date_from, date_to, page = 1, limit = 10 } = req.query;
+        
+        let query = `
+            SELECT t.*, u.username 
+            FROM transactions t 
+            LEFT JOIN users u ON t.user_id = u.id 
+            WHERE 1=1
+        `;
+        let params = [];
+        
+        if (type) {
+            query += ' AND t.type = ?';
+            params.push(type);
+        }
+        
+        if (status) {
+            query += ' AND t.status = ?';
+            params.push(status);
+        }
+        
+        if (date_from) {
+            query += ' AND DATE(t.created_at) >= ?';
+            params.push(date_from);
+        }
+        
+        if (date_to) {
+            query += ' AND DATE(t.created_at) <= ?';
+            params.push(date_to);
+        }
+        
+        query += ' ORDER BY t.created_at DESC';
+        
+        // Add pagination
+        const offset = (page - 1) * limit;
+        query += ' LIMIT ? OFFSET ?';
+        params.push(parseInt(limit), offset);
+        
+        const [transactions] = await db.query(query, params);
+        
+        // Get total count for pagination
+        let countQuery = 'SELECT COUNT(*) as total FROM transactions t WHERE 1=1';
+        let countParams = [];
+        
+        if (type) {
+            countQuery += ' AND t.type = ?';
+            countParams.push(type);
+        }
+        
+        if (status) {
+            countQuery += ' AND t.status = ?';
+            countParams.push(status);
+        }
+        
+        if (date_from) {
+            countQuery += ' AND DATE(t.created_at) >= ?';
+            countParams.push(date_from);
+        }
+        
+        if (date_to) {
+            countQuery += ' AND DATE(t.created_at) <= ?';
+            countParams.push(date_to);
+        }
+        
+        const [[{ total }]] = await db.query(countQuery, countParams);
+        
+        res.json({
+            data: transactions,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total,
+                pages: Math.ceil(total / limit)
+            }
+        });
+    } catch (error) {
+        logger.error('Failed to fetch transactions:', error);
+        res.status(500).json({ error: 'Failed to fetch transactions' });
+    }
+});
+
+// Get single transaction
+app.get('/api/admin/transactions/:id', checkAdminAuth, async (req, res) => {
+    try {
+        const transactionId = req.params.id;
+        const [[transaction]] = await db.query(`
+            SELECT t.*, u.username 
+            FROM transactions t 
+            LEFT JOIN users u ON t.user_id = u.id 
+            WHERE t.id = ?
+        `, [transactionId]);
+        
+        if (!transaction) {
+            return res.status(404).json({ error: 'Transaction not found' });
+        }
+        
+        res.json({ data: transaction });
+    } catch (error) {
+        logger.error('Failed to fetch transaction:', error);
+        res.status(500).json({ error: 'Failed to fetch transaction' });
+    }
+});
+
+// Approve transaction
+app.put('/api/admin/transactions/:id/approve', checkAdminAuth, async (req, res) => {
+    const transactionId = req.params.id;
+    const conn = await db.getPool().getConnection();
+    
+    try {
+        await conn.beginTransaction();
+        
+        // Get transaction details
+        const [[transaction]] = await conn.query(`
+            SELECT * FROM transactions WHERE id = ? AND status = 'pending'
+        `, [transactionId]);
+        
+        if (!transaction) {
+            await conn.rollback();
+            return res.status(404).json({ error: 'Pending transaction not found' });
+        }
+        
+        // Update transaction status
+        await conn.query(`
+            UPDATE transactions SET status = 'approved', processed_at = NOW() WHERE id = ?
+        `, [transactionId]);
+        
+        // If it's a recharge or VIP purchase, update user balance
+        if (transaction.type === 'recharge' || transaction.type === 'vip_purchase') {
+            await conn.query(`
+                UPDATE users SET balance = balance + ? WHERE id = ?
+            `, [transaction.amount, transaction.user_id]);
+        }
+        
+        // If it's a withdrawal, deduct from user balance
+        if (transaction.type === 'withdrawal') {
+            await conn.query(`
+                UPDATE users SET balance = balance - ? WHERE id = ?
+            `, [transaction.amount, transaction.user_id]);
+        }
+        
+        await conn.commit();
+        res.json({ message: 'Transaction approved successfully' });
+    } catch (error) {
+        await conn.rollback();
+        logger.error('Failed to approve transaction:', error);
+        res.status(500).json({ error: 'Failed to approve transaction' });
+    } finally {
+        conn.release();
+    }
+});
+
+// Reject transaction
+app.put('/api/admin/transactions/:id/reject', checkAdminAuth, async (req, res) => {
+    const transactionId = req.params.id;
+    
+    try {
+        // Update transaction status
+        await db.query(`
+            UPDATE transactions SET status = 'rejected', processed_at = NOW() WHERE id = ?
+        `, [transactionId]);
+        
+        res.json({ message: 'Transaction rejected successfully' });
+    } catch (error) {
+        logger.error('Failed to reject transaction:', error);
+        res.status(500).json({ error: 'Failed to reject transaction' });
+    }
+});
+
+// Export transactions
+app.get('/api/admin/transactions/export', checkAdminAuth, async (req, res) => {
+    try {
+        const { type, status, date_from, date_to } = req.query;
+        
+        let query = `
+            SELECT t.*, u.username 
+            FROM transactions t 
+            LEFT JOIN users u ON t.user_id = u.id 
+            WHERE 1=1
+        `;
+        let params = [];
+        
+        if (type) {
+            query += ' AND t.type = ?';
+            params.push(type);
+        }
+        
+        if (status) {
+            query += ' AND t.status = ?';
+            params.push(status);
+        }
+        
+        if (date_from) {
+            query += ' AND DATE(t.created_at) >= ?';
+            params.push(date_from);
+        }
+        
+        if (date_to) {
+            query += ' AND DATE(t.created_at) <= ?';
+            params.push(date_to);
+        }
+        
+        query += ' ORDER BY t.created_at DESC';
+        
+        const [transactions] = await db.query(query, params);
+        
+        // Convert to CSV
+        const csv = convertToCSV(transactions);
+        
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', 'attachment; filename=transactions.csv');
+        res.send(csv);
+    } catch (error) {
+        logger.error('Failed to export transactions:', error);
+        res.status(500).json({ error: 'Failed to export transactions' });
+    }
+});
+
+// ============================
+// ANNOUNCEMENTS ENDPOINTS
+// ============================
+
+// Announcements Endpoints
+app.get('/api/admin/announcements', checkAdminAuth, async (req, res) => {
+    try {
+        const [announcements] = await db.query('SELECT * FROM announcements ORDER BY created_at DESC');
+        res.json({ data: announcements });
+    } catch (error) {
+        logger.error('Failed to fetch announcements:', error);
+        res.status(500).json({ error: 'Failed to fetch announcements' });
+    }
+});
+
+app.get('/api/admin/announcements/:id', checkAdminAuth, async (req, res) => {
+    try {
+        const announcementId = req.params.id;
+        const [[announcement]] = await db.query('SELECT * FROM announcements WHERE id = ?', [announcementId]);
+        
+        if (!announcement) {
+            return res.status(404).json({ error: 'Announcement not found' });
+        }
+        
+        res.json({ data: announcement });
+    } catch (error) {
+        logger.error('Failed to fetch announcement:', error);
+        res.status(500).json({ error: 'Failed to fetch announcement' });
+    }
+});
+
+app.post('/api/admin/announcements', checkAdminAuth, async (req, res) => {
+    const { title, content, status } = req.body;
+    
+    if (!title || !content || !status) {
+        return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    try {
+        const [result] = await db.query(`
+            INSERT INTO announcements (title, content, status)
+            VALUES (?, ?, ?)
+        `, [title, content, status]);
+        
+        res.json({ message: 'Announcement created successfully', id: result.insertId });
+    } catch (error) {
+        logger.error('Failed to create announcement:', error);
+        res.status(500).json({ error: 'Failed to create announcement' });
+    }
+});
+
+app.put('/api/admin/announcements/:id', checkAdminAuth, async (req, res) => {
+    const announcementId = req.params.id;
+    const { title, content, status } = req.body;
+    
+    try {
+        // Check if announcement exists
+        const [[announcement]] = await db.query('SELECT id FROM announcements WHERE id = ?', [announcementId]);
+        
+        if (!announcement) {
+            return res.status(404).json({ error: 'Announcement not found' });
+        }
+        
+        // Update announcement
+        await db.query(`
+            UPDATE announcements 
+            SET title = ?, content = ?, status = ?
+            WHERE id = ?
+        `, [title, content, status, announcementId]);
+        
+        res.json({ message: 'Announcement updated successfully' });
+    } catch (error) {
+        logger.error('Failed to update announcement:', error);
+        res.status(500).json({ error: 'Failed to update announcement' });
+    }
+});
+
+app.delete('/api/admin/announcements/:id', checkAdminAuth, async (req, res) => {
+    const announcementId = req.params.id;
+    
+    try {
+        // Check if announcement exists
+        const [[announcement]] = await db.query('SELECT id FROM announcements WHERE id = ?', [announcementId]);
+        
+        if (!announcement) {
+            return res.status(404).json({ error: 'Announcement not found' });
+        }
+        
+        // Delete announcement
+        await db.query('DELETE FROM announcements WHERE id = ?', [announcementId]);
+        
+        res.json({ message: 'Announcement deleted successfully' });
+    } catch (error) {
+        logger.error('Failed to delete announcement:', error);
+        res.status(500).json({ error: 'Failed to delete announcement' });
+    }
+});
+
+// ============================
+// TASKS ENDPOINTS
+// ============================
+
+// Tasks Endpoints
+app.get('/api/admin/tasks', checkAdminAuth, async (req, res) => {
+    try {
+        const [tasks] = await db.query('SELECT * FROM tasks ORDER BY created_at DESC');
+        res.json({ data: tasks });
+    } catch (error) {
+        logger.error('Failed to fetch tasks:', error);
+        res.status(500).json({ error: 'Failed to fetch tasks' });
+    }
+});
+
+app.get('/api/admin/tasks/:id', checkAdminAuth, async (req, res) => {
+    try {
+        const taskId = req.params.id;
+        const [[task]] = await db.query('SELECT * FROM tasks WHERE id = ?', [taskId]);
+        
+        if (!task) {
+            return res.status(404).json({ error: 'Task not found' });
+        }
+        
+        res.json({ data: task });
+    } catch (error) {
+        logger.error('Failed to fetch task:', error);
+        res.status(500).json({ error: 'Failed to fetch task' });
+    }
+});
+
+app.post('/api/admin/tasks', checkAdminAuth, async (req, res) => {
+    const { title, description, reward, status } = req.body;
+    
+    if (!title || !description || !reward || !status) {
+        return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    try {
+        const [result] = await db.query(`
+            INSERT INTO tasks (title, description, reward, status)
+            VALUES (?, ?, ?, ?)
+        `, [title, description, reward, status]);
+        
+        res.json({ message: 'Task created successfully', id: result.insertId });
+    } catch (error) {
+        logger.error('Failed to create task:', error);
+        res.status(500).json({ error: 'Failed to create task' });
+    }
+});
+
+app.put('/api/admin/tasks/:id', checkAdminAuth, async (req, res) => {
+    const taskId = req.params.id;
+    const { title, description, reward, status } = req.body;
+    
+    try {
+        // Check if task exists
+        const [[task]] = await db.query('SELECT id FROM tasks WHERE id = ?', [taskId]);
+        
+        if (!task) {
+            return res.status(404).json({ error: 'Task not found' });
+        }
+        
+        // Update task
+        await db.query(`
+            UPDATE tasks 
+            SET title = ?, description = ?, reward = ?, status = ?
+            WHERE id = ?
+        `, [title, description, reward, status, taskId]);
+        
+        res.json({ message: 'Task updated successfully' });
+    } catch (error) {
+        logger.error('Failed to update task:', error);
+        res.status(500).json({ error: 'Failed to update task' });
+    }
+});
+
+app.delete('/api/admin/tasks/:id', checkAdminAuth, async (req, res) => {
+    const taskId = req.params.id;
+    
+    try {
+        // Check if task exists
+        const [[task]] = await db.query('SELECT id FROM tasks WHERE id = ?', [taskId]);
+        
+        if (!task) {
+            return res.status(404).json({ error: 'Task not found' });
+        }
+        
+        // Delete task
+        await db.query('DELETE FROM tasks WHERE id = ?', [taskId]);
+        
+        res.json({ message: 'Task deleted successfully' });
+    } catch (error) {
+        logger.error('Failed to delete task:', error);
+        res.status(500).json({ error: 'Failed to delete task' });
+    }
+});
+
+// ============================
+// TEAM ENDPOINTS
+// ============================
+
+// Team Endpoints
+app.get('/api/admin/team', checkAdminAuth, async (req, res) => {
+    try {
+        const [team] = await db.query('SELECT id, name, email, role, status, last_login FROM admin_users ORDER BY created_at DESC');
+        res.json({ data: team });
+    } catch (error) {
+        logger.error('Failed to fetch team:', error);
+        res.status(500).json({ error: 'Failed to fetch team' });
+    }
+});
+
+app.get('/api/admin/team/:id', checkAdminAuth, async (req, res) => {
+    try {
+        const memberId = req.params.id;
+        const [[member]] = await db.query('SELECT id, name, email, role, status, last_login FROM admin_users WHERE id = ?', [memberId]);
+        
+        if (!member) {
+            return res.status(404).json({ error: 'Team member not found' });
+        }
+        
+        res.json({ data: member });
+    } catch (error) {
+        logger.error('Failed to fetch team member:', error);
+        res.status(500).json({ error: 'Failed to fetch team member' });
+    }
+});
+
+app.post('/api/admin/team', checkAdminAuth, async (req, res) => {
+    const { name, email, password, role, status } = req.body;
+    
+    if (!name || !email || !password || !role || !status) {
+        return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    try {
+        // Hash password
+        const hashedPassword = await bcrypt.hash(password, 10);
+        
+        const [result] = await db.query(`
+            INSERT INTO admin_users (name, email, password, role, status)
+            VALUES (?, ?, ?, ?, ?)
+        `, [name, email, hashedPassword, role, status]);
+        
+        res.json({ message: 'Team member created successfully', id: result.insertId });
+    } catch (error) {
+        if (error.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ error: 'Email already exists' });
+        }
+        
+        logger.error('Failed to create team member:', error);
+        res.status(500).json({ error: 'Failed to create team member' });
+    }
+});
+
+app.put('/api/admin/team/:id', checkAdminAuth, async (req, res) => {
+    const memberId = req.params.id;
+    const { name, email, password, role, status } = req.body;
+    
+    try {
+        // Check if team member exists
+        const [[member]] = await db.query('SELECT id FROM admin_users WHERE id = ?', [memberId]);
+        
+        if (!member) {
+            return res.status(404).json({ error: 'Team member not found' });
+        }
+        
+        // Build update query
+        let query = 'UPDATE admin_users SET name = ?, email = ?, role = ?, status = ?';
+        let params = [name, email, role, status];
+        
+        // Add password to update if provided
+        if (password) {
+            const hashedPassword = await bcrypt.hash(password, 10);
+            query += ', password = ?';
+            params.push(hashedPassword);
+        }
+        
+        query += ' WHERE id = ?';
+        params.push(memberId);
+        
+        // Update team member
+        await db.query(query, params);
+        
+        res.json({ message: 'Team member updated successfully' });
+    } catch (error) {
+        if (error.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ error: 'Email already exists' });
+        }
+        
+        logger.error('Failed to update team member:', error);
+        res.status(500).json({ error: 'Failed to update team member' });
+    }
+});
+
+app.delete('/api/admin/team/:id', checkAdminAuth, async (req, res) => {
+    const memberId = req.params.id;
+    
+    try {
+        // Check if team member exists
+        const [[member]] = await db.query('SELECT id FROM admin_users WHERE id = ?', [memberId]);
+        
+        if (!member) {
+            return res.status(404).json({ error: 'Team member not found' });
+        }
+        
+        // Don't allow deletion of the last admin
+        const [[adminCount]] = await db.query('SELECT COUNT(*) as count FROM admin_users WHERE role = "admin"');
+        if (adminCount.count <= 1) {
+            return res.status(400).json({ error: 'Cannot delete the last admin user' });
+        }
+        
+        // Delete team member
+        await db.query('DELETE FROM admin_users WHERE id = ?', [memberId]);
+        
+        res.json({ message: 'Team member deleted successfully' });
+    } catch (error) {
+        logger.error('Failed to delete team member:', error);
+        res.status(500).json({ error: 'Failed to delete team member' });
+    }
+});
+
+// ============================
+// SETTINGS ENDPOINTS
+// ============================
+
+// Settings Endpoints
+app.get('/api/admin/settings', checkAdminAuth, async (req, res) => {
+    try {
+        const [settings] = await db.query('SELECT * FROM settings WHERE id = 1');
+        
+        if (settings.length === 0) {
+            // Create default settings if not exists
+            await db.query(`
+                INSERT INTO settings (id, site_name, site_url, admin_email, currency, min_withdrawal, referral_commission, maintenance_mode, maintenance_message)
+                VALUES (1, 'MajicEarn', 'https://majicearn.com', 'admin@majicearn.com', 'PKR', 500, 8, 0, '')
+            `);
+            
+            const [[newSettings]] = await db.query('SELECT * FROM settings WHERE id = 1');
+            return res.json({ data: newSettings });
+        }
+        
+        res.json({ data: settings[0] });
+    } catch (error) {
+        logger.error('Failed to fetch settings:', error);
+        res.status(500).json({ error: 'Failed to fetch settings' });
+    }
+});
+
+app.put('/api/admin/settings', checkAdminAuth, async (req, res) => {
+    const { site_name, site_url, admin_email, currency, min_withdrawal, referral_commission, maintenance_mode, maintenance_message } = req.body;
+    
+    try {
+        await db.query(`
+            UPDATE settings 
+            SET site_name = ?, site_url = ?, admin_email = ?, currency = ?, min_withdrawal = ?, referral_commission = ?, maintenance_mode = ?, maintenance_message = ?
+            WHERE id = 1
+        `, [site_name, site_url, admin_email, currency, min_withdrawal, referral_commission, maintenance_mode, maintenance_message]);
+        
+        res.json({ message: 'Settings updated successfully' });
+    } catch (error) {
+        logger.error('Failed to update settings:', error);
+        res.status(500).json({ error: 'Failed to update settings' });
     }
 });
 
