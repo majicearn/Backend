@@ -247,6 +247,35 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Test admin endpoint
+app.post('/api/admin/test', (req, res) => {
+  res.json({ 
+    message: 'Admin endpoint is working',
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development',
+    dbStatus: dbInitialized ? 'connected' : 'disconnected'
+  });
+});
+
+// Simple admin login test (no authentication required)
+app.post('/api/admin/simple-login', (req, res) => {
+  const { username, password } = req.body;
+  
+  // Check if admin credentials are correct
+  if (username === process.env.ADMIN_USERNAME && password === process.env.ADMIN_PASSWORD) {
+    res.json({ 
+      success: true, 
+      message: 'Credentials are valid',
+      token: 'test-token-' + Date.now()
+    });
+  } else {
+    res.status(401).json({ 
+      success: false, 
+      error: 'Invalid admin credentials' 
+    });
+  }
+});
+
 // Test DB endpoint
 app.get('/api/testdb', checkDbReady, async (req, res) => {
   try {
@@ -2610,3 +2639,4 @@ startServer().then(server => {
   logger.error("Failed to start server:", error);
   process.exit(1);
 });
+
