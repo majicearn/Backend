@@ -59,6 +59,14 @@ app.use((req, res, next) => {
   next();
 });
 
+// ✅ Cache-control middleware
+app.use((req, res, next) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  next();
+});
+
 // Rate limiter
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
@@ -2639,4 +2647,5 @@ startServer().then(server => {
   logger.error("Failed to start server:", error);
   process.exit(1);
 });
+
 
